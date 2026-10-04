@@ -1,0 +1,467 @@
+import AppKit
+import KDEConnectKit
+import Network
+import Observation
+
+enum Pane: String, CaseIterable, Identifiable, Hashable {
+    case overview, calendar, notes, messages, notifications, media, files, clipboard, remote, connection, settings, testing
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .overview: "Overview"
+        case .calendar: "Calendar"
+        case .notes: "Notes"
+        case .messages: "Messages"
+        case .notifications: "Notifications"
+        case .media: "Now Playing"
+        case .files: "Transfers"
+        case .clipboard: "Clipboard"
+        case .remote: "Remote Input"
+        case .connection: "Connection"
+        case .settings: "Settings"
+        case .testing: "Testing"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .overview: "smartphone"
+        case .calendar: "calendar"
+        case .notes: "note.text"
+        case .messages: "message.fill"
+        case .notifications: "bell.badge.fill"
+        case .media: "play.circle.fill"
+        case .files: "arrow.up.arrow.down.circle.fill"
+        case .clipboard: "doc.on.clipboard.fill"
+        case .remote: "cursorarrow.rays"
+        case .connection: "antenna.radiowaves.left.and.right"
+        case .settings: "gearshape.fill"
+        case .testing: "hammer.fill"
+        }
+    }
+
+    var tint: NSColor {
+        switch self {
+        case .overview: .systemGreen
+        case .calendar: .systemRed
+        case .notes: .systemYellow
+        case .messages: .systemBlue
+        case .notifications: .systemRed
+        case .media: .systemPink
+        case .files: .systemOrange
+        case .clipboard: .systemIndigo
+        case .remote: .systemPurple
+        case .connection: .systemTeal
+        case .settings: .systemGray
+        case .testing: .systemBrown
+        }
+    }
+}
+
+@MainActor @Observable
+final class AppModel {
+    /// One instance for the whole app, shared by the UI and Shortcuts actions.
+    static let shared = AppModel()
+
+    enum State: Equatable { case connecting, connected, failed(String) }
+
+    private(set) var state: State = .connecting
+    private(set) var devices: [Device] = []
+    private(set) var announcedName = ""
+    /// Connection types from the engine, reported as "DisplayName|InternalName|enabled".
+    private(set) var linkProviders: [(name: String, title: String, enabled: Bool)] = []
+    var selectedDeviceID: String?
+    var section: Pane? = .overview
+    /// Set to ask the always-alive menu bar label to open the main window.
+    var wantsMainWindow = false
+    /// Presents the "Add Device" sheet in the main window.
+    var showAddDevice = false
+    /// Presents the New Message sheet (with an optional prefilled "To" query).
+    var showCompose = false
+    var composePrefill = ""
+    /// Addresses the engine connects to directly (for networks where discovery doesn't work).
+    private(set) var customAddresses: [String] = []
+
+    /// User-initiated reconnect in progress, and the outcome of the last one.
+    private(set) var isReconnecting = false
+    private(set) var reconnectNote: String?
+    private(set) var engineStartedAt: Date?
+    private(set) var busAddress = ""
+    private(set) var macAddresses: [String] = []
+
+    /// Recent connection history (newest first), also written to ~/Library/Logs/Android/connection.log.
+    var events: [ConnectionEvent] = []
+
+    @ObservationIgnored private var bus: DBusConnection?
+    @ObservationIgnored private var reconnecting = false
+    @ObservationIgnored var nudgeTask: Task<Void, Never>?
+    @ObservationIgnored var pathMonitor: NWPathMonitor?
+    @ObservationIgnored var lastPathSignature = ""
+    @ObservationIgnored var lastReachable: [String: Bool] = [:]
+    /// Devices paired at the last refresh (to notice unpairing).
+    @ObservationIgnored private var lastPaired: Set<String> = []
+    @ObservationIgnored var notifiedPairing: Set<String> = []
+
+    init() {
+        LegacySettings.migrate()
+        log(.info, "Janus started")
+        Self.cleanOutgoingCache()
+        Notifier.shared.setup(model: self)
+        Task { await connect() }
+        startReliabilityMonitors()
+        // Measure round-trip latency: every 10 s while it's on screen, otherwise every 2 min.
+        // Each ping wakes the phone's Wi-Fi, so it isn't done more often than someone can see.
+        Task { [weak self] in
+            var lastPing = Date.distantPast
+            while true {
+                guard let self else { return }
+                let visible = StatusItemController.shared.isPanelShown || DockPresence.mainWindowVisible
+                if Date().timeIntervalSince(lastPing) >= (visible ? 10 : 120) {
+                    lastPing = .now
+                    for d in self.connectedDevices {
+                        if let ip = d.addresses.first(where: { !$0.contains(":") }) ?? d.addresses.first {
+                            d.recordLatency(await Latency.ping(ip))
+                        }
+                    }
+                    self.macAddresses = Latency.localIPv4Addresses()
+                }
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
+    }
+
+    var selectedDevice: Device? {
+        devices.first { $0.id == selectedDeviceID } ?? pairedDevices.first
+    }
+    var pairedDevices: [Device] { devices.filter(\.isPaired) }
+    var connectedDevices: [Device] { devices.filter { $0.isPaired && $0.isReachable } }
+    var discoverableDevices: [Device] { devices.filter { !$0.isPaired && $0.isReachable } }
+    var pairingRequests: [Device] { devices.filter(\.isPairRequestedByPeer) }
+
+    // MARK: Connection
+
+    func connect() async {
+        state = .connecting
+        do {
+            let bus = try await KDEConnectEngine.connect()
+            self.bus = bus
+            bus.onClose = { [weak self] in Task { @MainActor in self?.connectionLost() } }
+            bus.addSignalHandler { [weak self] msg in Task { @MainActor in self?.handle(msg) } }
+            try await bus.addMatch("type='signal',sender='\(KDEConnectEngine.service)'")
+            // Watchdog: learn immediately if the engine exits or restarts.
+            try await bus.addMatch("type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='\(KDEConnectEngine.service)'")
+            state = .connected
+            log(.info, "Connected to the connection engine")
+            busAddress = KDEConnectEngine.currentAddress() ?? ""
+            engineStartedAt = KDEConnectEngine.daemonStartDate()
+            await refreshDevices()
+            announcedName = (try? await daemonCall("announcedName").first?.string) ?? ""
+            syncMacName()
+            await refreshLinkProviders()
+            await refreshCustomAddresses()
+        } catch {
+            state = .failed(error.localizedDescription)
+            log(.warning, "Couldn't reach the connection engine: \(error.localizedDescription)")
+            scheduleReconnect()
+        }
+    }
+
+    private func connectionLost() {
+        guard state == .connected else { return }
+        log(.warning, "Lost the connection engine's message bus; restarting")
+        bus = nil
+        devices = []
+        lastReachable = [:]
+        lastPaired = []
+        state = .connecting
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard !reconnecting else { return }
+        reconnecting = true
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            reconnecting = false
+            if state != .connected { await connect() }
+        }
+    }
+
+    /// Escalating reconnect: ask the engine to rediscover; if the phone doesn't come back,
+    /// restart the engine itself; finally report what happened.
+    func reconnect() {
+        guard !isReconnecting else { return }
+        isReconnecting = true
+        reconnectNote = nil
+        Task {
+            defer { isReconnecting = false }
+            if state == .connected {
+                refreshNetwork()
+                if await waitForPhone(seconds: 8) { reconnectNote = "Reconnected"; return }
+            }
+            reconnectNote = "Restarting the connection engine…"
+            await restartEngine()
+            if await waitForPhone(seconds: 20) {
+                reconnectNote = "Reconnected"
+            } else {
+                reconnectNote = "Phone not found. Open the companion app on your phone and check it's on the same Wi-Fi."
+            }
+        }
+    }
+
+    private func waitForPhone(seconds: Int) async -> Bool {
+        for _ in 0..<(seconds * 2) {
+            if !connectedDevices.isEmpty { return true }
+            try? await Task.sleep(for: .milliseconds(500))
+            if seconds > 0, state == .connected, connectedDevices.isEmpty { await refreshDevices() }
+        }
+        return !connectedDevices.isEmpty
+    }
+
+    /// Stops kdeconnectd and starts it again on the same message bus.
+    func restartEngine() async {
+        log(.info, "Restarting the connection engine")
+        reconnecting = true                     // suppress the automatic reconnect while we do it
+        let old = bus
+        bus = nil
+        devices = []
+        lastReachable = [:]
+        lastPaired = []
+        state = .connecting
+        old?.shutdown()
+        KDEConnectEngine.stopEngine()
+        try? await Task.sleep(for: .seconds(1))
+        reconnecting = false
+        await connect()
+    }
+
+    @discardableResult
+    func daemonCall(_ member: String, _ args: [DBusValue] = []) async throws -> [DBusValue] {
+        guard let bus else { throw DBusError(name: "Disconnected", message: "Not connected") }
+        return try await bus.call(destination: KDEConnectEngine.service, path: KDEConnectEngine.daemonPath,
+                                  interface: "org.kde.kdeconnect.daemon", member: member, args)
+    }
+
+    func refreshDevices() async {
+        guard let bus, let ids = try? await daemonCall("devices", [false, false]).first?.strings else { return }
+        var next: [Device] = []
+        for id in ids {
+            if let existing = devices.first(where: { $0.id == id }) {
+                next.append(existing)
+            } else {
+                next.append(Device(id: id, bus: bus))
+            }
+        }
+        devices = next
+        for d in next { await d.refresh() }
+        devices.sort { ($0.isPaired && $0.isReachable ? 0 : $0.isPaired ? 1 : 2, $0.name) < ($1.isPaired && $1.isReachable ? 0 : $1.isPaired ? 1 : 2, $1.name) }
+        for d in devices where d.isPairRequestedByPeer && !notifiedPairing.contains(d.id) {
+            notifiedPairing.insert(d.id)
+            log(.info, "\(d.name) wants to pair")
+            Notifier.shared.pairingRequest(d)
+        }
+        let stillAsking = Set(devices.filter(\.isPairRequestedByPeer).map(\.id))
+        // Answered (here, on the phone) or cancelled: its card goes away.
+        for id in notifiedPairing.subtracting(stillAsking) { BannerCenter.shared.dismiss("pair.\(id)") }
+        notifiedPairing.formIntersection(stillAsking)
+        for d in devices where d.isPaired {
+            let was = lastReachable[d.id]
+            if was != d.isReachable {
+                if d.isReachable { log(.success, "\(d.name) connected via \(d.transport)") }
+                else if was == true { log(.warning, "\(d.name) disconnected") }
+                lastReachable[d.id] = d.isReachable
+            }
+        }
+        reconcilePairing()
+        URLRouter.publishPhoneName(selectedDevice?.name)
+    }
+
+    /// After a refresh: notices devices unpaired from either side and keeps a paired device selected.
+    func reconcilePairing() {
+        // Unpaired from either side: say so, and stop mirroring it.
+        let paired = Set(devices.filter(\.isPaired).map(\.id))
+        for d in devices where lastPaired.contains(d.id) && !paired.contains(d.id) {
+            log(.warning, "\(d.name) is no longer paired")
+            if MirrorController.shared.deviceID == d.id { MirrorController.shared.stop() }
+        }
+        lastPaired = paired
+        if !devices.isEmpty {
+            let mine = Set(devices.filter { $0.isPaired && DeviceTrust.isMine($0) }.map(\.id))
+            CalendarStore.shared.keepOnly(deviceIDs: mine)
+            NotificationHistory.shared.keepOnly(deviceIDs: mine)
+        }
+        DeviceTrust.migrate(devices)
+        MacActions.publish()
+        // The window and menu bar only work with a paired device selected (an unpaired one hides the device
+        // switcher), so move on to another paired device whenever the selected one isn't paired any more.
+        if selectedDevice?.isPaired != true {
+            selectedDeviceID = (connectedDevices.first ?? pairedDevices.first)?.id ?? (selectedDevice == nil ? nil : selectedDeviceID)
+        }
+    }
+
+    func refreshLinkProviders() async {
+        let raw = (try? await daemonCall("linkProviders").first?.strings) ?? []
+        linkProviders = raw.map { entry in
+            let parts = entry.split(separator: "|").map(String.init)
+            let display = parts.first ?? entry
+            let title = display.localizedCaseInsensitiveContains("lan") ? "Wi-Fi / local network"
+                : display.localizedCaseInsensitiveContains("bluetooth") ? "Bluetooth"
+                : display.localizedCaseInsensitiveContains("loopback") ? "Loopback (testing)" : display
+            return (name: parts.count > 1 ? parts[1] : display, title: title, enabled: parts.last == "enabled")
+        }
+    }
+
+    func setLinkProvider(_ name: String, enabled: Bool) {
+        Task {
+            try? await daemonCall("setLinkProviderState", [.string(name), .bool(enabled)])
+            await refreshLinkProviders()
+        }
+    }
+
+    // MARK: Devices
+
+    /// Unpairs a device and forgets its nickname. The phone must be paired again to reconnect.
+    func removeDevice(_ device: Device) {
+        log(.info, "Removed \(device.name)")
+        device.unpair()
+        DeviceNicknames.set(device.id, nil)
+        if selectedDeviceID == device.id { selectedDeviceID = nil }
+        Task {
+            try? await Task.sleep(for: .seconds(1))
+            await refreshDevices()
+        }
+    }
+
+    func refreshCustomAddresses() async {
+        guard let bus else { return }
+        customAddresses = (try? await bus.getProperty(destination: KDEConnectEngine.service, path: KDEConnectEngine.daemonPath,
+                                                      interface: "org.kde.kdeconnect.daemon", name: "customDevices"))?.strings ?? []
+    }
+
+    func setCustomAddresses(_ list: [String]) {
+        guard let bus else { return }
+        customAddresses = list
+        Task {
+            try? await bus.setProperty(destination: KDEConnectEngine.service, path: KDEConnectEngine.daemonPath,
+                                       interface: "org.kde.kdeconnect.daemon", name: "customDevices", value: .strings(list))
+            refreshNetwork()
+            await refreshCustomAddresses()
+        }
+    }
+
+    /// Adds a phone's IP address (or hostname) for direct connection, then looks for it.
+    func addAddress(_ raw: String) -> Bool {
+        let address = raw.trimmingCharacters(in: .whitespaces)
+        guard !address.isEmpty, !address.contains(" ") else { return false }
+        if !customAddresses.contains(address) { setCustomAddresses(customAddresses + [address]) }
+        log(.info, "Looking for a device at \(address)")
+        return true
+    }
+
+    /// Sets how this Mac appears on phones. A name typed by the owner sticks; otherwise the app
+    /// follows the Mac's Computer Name (see `syncMacName`).
+    /// The phone's own Do Not Disturb changed (not in response to us).
+    func phoneDNDChanged(_ on: Bool, device: Device) {
+        log(.info, "\(device.name) turned Do Not Disturb \(on ? "on" : "off")")
+    }
+
+    func setAnnouncedName(_ name: String, userChosen: Bool = true) {
+        let clean = Self.protocolSafeName(name)
+        guard !clean.isEmpty else { return }
+        if userChosen {
+            UserDefaults.standard.set(clean != Self.protocolSafeName(Self.computerName), forKey: "macNameCustomized")
+        }
+        announcedName = clean
+        Task { try? await daemonCall("setAnnouncedName", [.string(clean)]) }
+    }
+
+    /// The Mac's Computer Name (System Settings → General → About → Name).
+    static var computerName: String {
+        Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+    }
+
+    /// Device names may not contain "',;:.!?()[]<> and are at most 32 characters (as the engine enforces);
+    /// a straight apostrophe becomes the typographic one so "Alex's" survives.
+    static func protocolSafeName(_ raw: String) -> String {
+        let forbidden = Set("\"',;:.!?()[]<>")
+        let cleaned = String(raw.replacingOccurrences(of: "'", with: "’").filter { !forbidden.contains($0) })
+            .trimmingCharacters(in: .whitespaces)
+        return String(cleaned.prefix(32)).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Announce the Computer Name unless the owner picked a different name in Settings.
+    private func syncMacName() {
+        guard !UserDefaults.standard.bool(forKey: "macNameCustomized") else { return }
+        let wanted = Self.protocolSafeName(Self.computerName)
+        guard !wanted.isEmpty, wanted != announcedName else { return }
+        log(.info, "This Mac now appears on phones as “\(wanted)”")
+        setAnnouncedName(wanted, userChosen: false)
+    }
+
+    func refreshNetwork() {
+        Task { try? await daemonCall("forceOnNetworkChange") }
+    }
+
+    // MARK: Signals
+
+    private func handle(_ msg: DBusMessage) {
+        guard let path = msg.path, let member = msg.member else { return }
+        if member == "NameOwnerChanged", msg.body.first?.string == KDEConnectEngine.service {
+            let newOwner = msg.body.count > 2 ? msg.body[2].string ?? "" : ""
+            if newOwner.isEmpty, state == .connected, !reconnecting {
+                log(.warning, "The connection engine stopped unexpectedly; starting it again")
+                Task { await restartEngine() }
+            }
+            return
+        }
+        if path == KDEConnectEngine.daemonPath {
+            switch member {
+            case "deviceAdded", "deviceRemoved", "deviceListChanged", "deviceVisibilityChanged", "pairingRequestsChanged":
+                Task { await refreshDevices() }
+            case "announcedNameChanged":
+                announcedName = msg.body.first?.string ?? announcedName
+            case "linkProvidersChanged":
+                Task { await refreshLinkProviders() }
+            default: break
+            }
+            return
+        }
+        let prefix = KDEConnectEngine.daemonPath + "/devices/"
+        guard path.hasPrefix(prefix) else { return }
+        let rest = path.dropFirst(prefix.count).split(separator: "/", maxSplits: 1).map(String.init)
+        guard let device = devices.first(where: { $0.id == rest[0] }) else {
+            Task { await refreshDevices() }
+            return
+        }
+        device.handle(member: member, interface: msg.interface ?? "", subpath: rest.count > 1 ? rest[1] : nil, body: msg.body)
+        if member == "pairStateChanged" || member == "reachableChanged" {
+            Task { await refreshDevices() }
+        }
+    }
+}
+
+extension AppModel {
+    /// An address on this Mac's own network ("192.168.10.42"), for "e.g." hints.
+    nonisolated static var exampleAddress: String {
+        guard let mine = Latency.localIPv4Addresses().first else { return "192.168.1.42" }
+        let parts = mine.split(separator: ".")
+        return parts.count == 4 ? parts.prefix(3).joined(separator: ".") + ".42" : mine
+    }
+}
+
+
+/// The app's bundle id changed with the move to GitHub (it was "local.android.connect"). macOS keeps settings per id,
+/// so on the first launch under the new id the old settings are copied over once (pairings, notes and history live
+/// in files and the engine's own config, which don't depend on the id).
+enum LegacySettings {
+    static let oldDomain = "local.android.connect"
+
+    static func migrate() {
+        let defaults = UserDefaults.standard
+        guard Bundle.main.bundleIdentifier != oldDomain, !defaults.bool(forKey: "migrated.fromLegacyId"),
+              let old = defaults.persistentDomain(forName: oldDomain), !old.isEmpty else { return }
+        for (key, value) in old where defaults.object(forKey: key) == nil { defaults.set(value, forKey: key) }
+        defaults.set(true, forKey: "migrated.fromLegacyId")
+    }
+}

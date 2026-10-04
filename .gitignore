@@ -1,0 +1,13 @@
+# Build output
+build.noindex/
+ui/.build/
+.swiftpm/
+*.xcuserstate
+DerivedData/
+
+# Downloaded engine and binaries (never committed)
+*.app
+*.dmg
+tools/snap
+
+.DS_Store
