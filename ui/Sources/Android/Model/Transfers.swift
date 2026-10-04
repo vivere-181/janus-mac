@@ -81,6 +81,7 @@ final class TransferStore {
     @ObservationIgnored private(set) var pendingBatch: Batch?
 
     func expectIncoming(totalBytes: Int64, files: Int, device: Device) {
+        TransferMonitor.shared.activate()
         // More files joining a running send: the latest announcement updates the same batch.
         if var b = pendingBatch, b.deviceID == device.id,
            Date().timeIntervalSince(b.announced) < 30 || items.contains(where: { $0.batchID == b.id && $0.state == .inProgress }) {
@@ -216,24 +217,55 @@ final class TransferMonitor {
     private var seenSending: Set<String> = []
     private var sendQueuedAt: [UUID: Date] = [:]
     private var receivingSince: [String: Date] = [:]
+    private var interval: TimeInterval = 0
+    private var quietSince: Date?
+    private var downloadsWatch: FSEventStreamRef?
 
+    /// Asleep until a transfer can happen: a send from this Mac, the phone announcing files, or something being
+    /// written to Downloads (macOS reports that; nothing is polled while idle). Then it samples the engine's open files
+    /// (progress, speed) and goes back to sleep 10 s after the last transfer.
     func start() {
-        guard timer == nil else { return }
-        schedule(interval: 1.0)
+        guard downloadsWatch == nil else { return }
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0].path
+        var context = FSEventStreamContext(version: 0, info: nil, retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, _, _, _, _, _ in
+            DispatchQueue.main.async { MainActor.assumeIsolated { TransferMonitor.shared.activate() } }
+        }
+        guard let stream = FSEventStreamCreate(nil, callback, &context, [downloads] as CFArray,
+                                               FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.5,
+                                               FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)) else { return }
+        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamStart(stream)
+        downloadsWatch = stream
     }
 
-    func expectSends() { schedule(interval: 0.3) }
+    /// Something may be transferring: sample every second (every 0.3 s while this Mac sends).
+    func activate(fast: Bool = false) {
+        quietSince = nil
+        schedule(interval: fast ? 0.3 : max(interval == 0 ? 1.0 : interval, fast ? 0.3 : 0))
+    }
+
+    func expectSends() { activate(fast: true) }
 
     private func schedule(interval: TimeInterval) {
+        guard interval != self.interval || timer == nil else { return }
+        self.interval = interval
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        t.tolerance = interval * 0.2   // lets macOS group the wake-ups
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func sleep() {
+        timer?.invalidate(); timer = nil; interval = 0; quietSince = nil
     }
 
     private func tick() {
         let store = TransferStore.shared
-        guard let pid = KDEConnectEngine.daemonPID() else { return }
+        guard let pid = KDEConnectEngine.daemonPID() else { sleep(); return }
         let now = ProcessInfo.processInfo.systemUptime
         let open = Self.openFiles(pid: pid)
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -308,7 +340,15 @@ final class TransferMonitor {
                 receivingSince[path] = nil; lastOffsets[path] = nil
             }
         }
-        if store.active.isEmpty { schedule(interval: 1.0) }
+        // Nothing moving (no transfer in progress, the engine writing nothing to Downloads or elsewhere): back to sleep
+        // after 10 quiet seconds.
+        let writing = open.contains { $0.writing && !$0.path.hasPrefix(home + "/Library") && !$0.path.hasPrefix("/private") && !$0.path.hasPrefix("/dev") }
+        if store.active.isEmpty && !writing {
+            if let q = quietSince { if Date().timeIntervalSince(q) > 10 { sleep() } } else { quietSince = Date() }
+            if interval < 1, timer != nil { schedule(interval: 1.0) }
+        } else {
+            quietSince = nil
+        }
     }
 
     private func smooth(_ old: Double, _ new: Double) -> Double { old == 0 ? new : old * 0.6 + new * 0.4 }

@@ -199,7 +199,7 @@ struct DeviceHeroCard: View {
 
     /// One row per stat, label left and value right, like an About page.
     private var stats: some View {
-        TimelineView(.periodic(from: .now, by: 60)) { _ in
+        TimelineView(.everyMinute) { _ in
             VStack(spacing: 7) {
                 ForEach(statItems) { stat($0) }
             }

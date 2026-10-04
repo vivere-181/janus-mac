@@ -1,3 +1,4 @@
+import AppKit
 import CryptoKit
 import Foundation
 
@@ -14,20 +15,10 @@ struct Note: Codable, Identifiable, Equatable {
     var deleted: Date?
 
     /// The first non-empty line, without its Markdown (R30).
-    var title: String {
-        let first = text.split(separator: "\n", omittingEmptySubsequences: true)
-            .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.map(String.init) ?? ""
-        let t = Markdown.plain(first)
-        return t.isEmpty ? "New Note" : t
-    }
+    var title: String { NoteSummary.of(self).title }
 
-    /// The text after the title, on one line, without Markdown.
-    var preview: String {
-        text.split(separator: "\n", omittingEmptySubsequences: true)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.dropFirst()
-            .map { Markdown.plain(String($0)) }
-            .filter { !$0.isEmpty }.joined(separator: " ")
-    }
+    /// The text after the title, on one line, without Markdown (only as much as a list row shows).
+    var preview: String { NoteSummary.of(self).preview }
 
     static func stripChecklist(_ line: String) -> String {
         for p in ["- [ ] ", "- [x] ", "- [X] "] where line.hasPrefix(p) { return String(line.dropFirst(p.count)) }
@@ -305,11 +296,53 @@ final class NotesStore {
         save()
     }
 
+    /// Written once changes pause for a second (and when the app quits), not on every edit.
+    @ObservationIgnored private var saveTask: Task<Void, Never>?
+    @ObservationIgnored private var quitObserver: Any?
+
     private func save() {
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard let self, !Task.isCancelled else { return }
+            self.writeNow()
+        }
+        if quitObserver == nil {
+            quitObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { NotesStore.shared.writeNow(sync: true) }
+            }
+        }
+    }
+
+    func writeNow(sync: Bool = false) {
+        saveTask?.cancel(); saveTask = nil
         let saved = Saved(notes: notes, acked: acked)
         let url = Self.file
-        Task.detached(priority: .utility) {
-            if let data = try? JSONEncoder().encode(saved) { try? data.write(to: url, options: .atomic) }
+        let write = { if let data = try? JSONEncoder().encode(saved) { try? data.write(to: url, options: .atomic) } }
+        if sync { write() } else { Task.detached(priority: .utility) { write() } }
+    }
+}
+
+
+/// Titles and previews, worked out once per version of a note (list rows asked for them on every render).
+enum NoteSummary {
+    private final class Box { let title: String, preview: String; init(_ t: String, _ p: String) { title = t; preview = p } }
+    nonisolated(unsafe) private static let cache: NSCache<NSString, Box> = { let c = NSCache<NSString, Box>(); c.countLimit = 1000; return c }()
+
+    static func of(_ note: Note) -> (title: String, preview: String) {
+        let key = (note.id + "#" + note.rev) as NSString
+        if let b = cache.object(forKey: key) { return (b.title, b.preview) }
+        var lines = note.text.split(separator: "\n", omittingEmptySubsequences: true).lazy
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.makeIterator()
+        let first = lines.next().map(String.init) ?? ""
+        let t = Markdown.plain(first)
+        var preview = ""
+        while preview.count < 200, let line = lines.next() {   // a row shows one line; no need for the whole note
+            let p = Markdown.plain(String(line))
+            if !p.isEmpty { preview += preview.isEmpty ? p : " " + p }
         }
+        let box = Box(t.isEmpty ? "New Note" : t, preview)
+        cache.setObject(box, forKey: key)
+        return (box.title, box.preview)
     }
 }

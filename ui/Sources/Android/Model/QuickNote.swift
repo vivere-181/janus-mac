@@ -41,6 +41,7 @@ enum QuickNote {
 
     static func close() {
         panel?.orderOut(nil)
+        panel?.contentViewController = nil   // the editor and its text go; made again the next time it opens
         // A quick note left empty isn't kept.
         if let n = NotesStore.shared.note(lastID), n.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             NotesStore.shared.deleteNow(n.id)

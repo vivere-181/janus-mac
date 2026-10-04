@@ -107,6 +107,7 @@ enum DockPresence {
     @MainActor static func update() {
         if UserDefaults.standard.bool(forKey: "noDockToggle") { return }
         let visible = NSApp.windows.contains { $0.identifier?.rawValue == "main" && $0.isVisible }
+        AppModel.shared.uiVisibilityChanged()
         let policy: NSApplication.ActivationPolicy = visible ? .regular : .accessory
         if NSApp.activationPolicy() != policy {
             NSApp.setActivationPolicy(policy)

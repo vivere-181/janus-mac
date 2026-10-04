@@ -65,7 +65,14 @@ final class MirrorController {
     @ObservationIgnored private var finder: AdbServiceFinder?
     @ObservationIgnored private var relay: MirrorRelay?
     @ObservationIgnored private var prepareReply: CheckedContinuation<String?, Never>?
-    @ObservationIgnored let view = MirrorVideoView()
+    /// The video view (and with it the video frameworks) exists only while mirroring is used.
+    @ObservationIgnored private var videoView: MirrorVideoView?
+    var view: MirrorVideoView {
+        if let v = videoView { return v }
+        let v = MirrorVideoView()
+        videoView = v
+        return v
+    }
 
     var isActive: Bool {
         switch state { case .idle, .failed: false; default: true }
@@ -261,16 +268,41 @@ final class MirrorController {
         clipboardTimer = nil
     }
 
+    /// The app's own adb server (Wi-Fi mirroring) isn't left running: it stops 2 minutes after mirroring ends, unless
+    /// mirroring started again.
+    @ObservationIgnored private var adbStop: Task<Void, Never>?
+    private func stopAdbServerLater() {
+        adbStop?.cancel()
+        adbStop = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(120))
+            guard !Task.isCancelled, let self, !self.isActive else { return }
+            _ = await ADB.wifi.run(["kill-server"], timeout: 5)
+        }
+    }
+
     // MARK: Phone asleep
 
     /// Notices the phone going to sleep (power button, or its timeout) and waking up (e.g. picked up).
+    /// Frames arriving mean the phone is awake (no question asked). Only when the picture stops (asleep, or simply
+    /// nothing changing on screen) is the phone asked over adb: 2 s after the last frame, then at most every 10 s.
     private func watchPower(adb: ADB, serial: String) {
         powerWatch?.cancel()
         powerWatch = Task { [weak self] in
+            var lastFrames = -1, lastFrameAt = Date(), lastCheck = Date.distantPast
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
+                try? await Task.sleep(for: .seconds(2), tolerance: .milliseconds(500))
+                guard let self, self.state == .mirroring else { continue }
+                let frames = self.view.frameCount
+                if frames != lastFrames {
+                    lastFrames = frames; lastFrameAt = .now
+                    if self.phoneAsleep { self.phoneAsleep = false }
+                    continue
+                }
+                guard !self.phoneAsleep, Date().timeIntervalSince(lastFrameAt) >= 2,
+                      Date().timeIntervalSince(lastCheck) >= 10 || lastCheck < lastFrameAt else { continue }
+                lastCheck = .now
                 let r = await adb.run(["-s", serial, "shell", "dumpsys power | grep -m1 mWakefulness="], timeout: 5)
-                guard !Task.isCancelled, let self, self.state == .mirroring, r.output.contains("mWakefulness=") else { continue }
+                guard !Task.isCancelled, self.state == .mirroring, r.output.contains("mWakefulness=") else { continue }
                 let asleep = !r.output.contains("Awake")
                 if asleep != self.phoneAsleep { self.phoneAsleep = asleep }
             }
@@ -335,7 +367,9 @@ final class MirrorController {
         relay?.stop()
         relay = nil
         link = nil
-        view.flush()
+        stopAdbServerLater()
+        videoView?.flush()
+        if window == nil { videoView = nil }   // its window is gone: nothing shows it any more
         if wasMirroring, let device {
             device.command("mirror:stopped")
             device.command("mirror:done")

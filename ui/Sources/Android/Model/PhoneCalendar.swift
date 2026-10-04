@@ -102,7 +102,13 @@ final class CalendarStore {
     // MARK: Snapshots from the phone
 
     /// A complete snapshot (JSON) from one of the owner's phones.
+    /// The last snapshot text per phone: the same one again (a refresh, a reconnect) changes nothing.
+    @ObservationIgnored private var lastSnapshot: [String: Int] = [:]
+
     func apply(json: String, from device: Device) {
+        let fingerprint = json.hashValue
+        if lastSnapshot[device.id] == fingerprint, snapshots[device.id] != nil { return }
+        lastSnapshot[device.id] = fingerprint
         guard let data = json.data(using: .utf8),
               let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
         // Event times are absolute: no clock correction by "now" (a snapshot re-read later, e.g. at startup,

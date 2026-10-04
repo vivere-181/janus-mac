@@ -198,7 +198,7 @@ final class Device: Identifiable {
     }
 
     private func applyStatus(_ text: String) {
-        UserDefaults.standard.set(true, forKey: "reportsStatus.\(id)")
+        if !UserDefaults.standard.bool(forKey: "reportsStatus.\(id)") { UserDefaults.standard.set(true, forKey: "reportsStatus.\(id)") }
         MacState.changed()   // first report after connecting: send the Mac's own state back (only if new)
         var s = status ?? Status()
         for pair in text.split(separator: ";") {
@@ -359,12 +359,18 @@ final class Device: Identifiable {
         supportedPlugins = p["supportedPlugins"]?.strings ?? []
         let loaded = Set((try? await call(nil, "", "loadedPlugins").first?.strings) ?? [])
         let newlyLoaded = loaded.subtracting(loadedPlugins)
-        loadedPlugins = loaded
-        var enabled = Set<String>()
-        for plugin in supportedPlugins {
-            if (try? await call(nil, "", "isPluginEnabled", [.string(plugin)]).first?.bool) == true { enabled.insert(plugin) }
+        let pluginsChanged = loaded != loadedPlugins
+        if pluginsChanged { loadedPlugins = loaded }
+        // Which plugins are switched on: asked (one call per plugin) only when something about plugins changed.
+        var enabled = enabledPlugins
+        if pluginStateStale || pluginsChanged {
+            enabled = []
+            for plugin in supportedPlugins {
+                if (try? await call(nil, "", "isPluginEnabled", [.string(plugin)]).first?.bool) == true { enabled.insert(plugin) }
+            }
+            pluginStateStale = false
+            if enabled != enabledPlugins { enabledPlugins = enabled }
         }
-        enabledPlugins = enabled
         // My device / someone else's: ask once after pairing; keep someone else's device limited.
         if UserDefaults.standard.bool(forKey: "trust.migrated"), isPaired {
             if !wasPaired, DeviceTrust.level(self) == nil { DeviceTrust.ask(self) }
@@ -375,6 +381,9 @@ final class Device: Identifiable {
         guard isPaired && isReachable else { return }
         await refreshPlugins(firstLoad: !newlyLoaded.isEmpty)
     }
+
+    /// Set when the engine says plugins changed (or at start): the next refresh asks which are enabled.
+    @ObservationIgnored var pluginStateStale = true
 
     func refreshPlugins(firstLoad: Bool) async {
         if has("battery") {
@@ -394,7 +403,8 @@ final class Device: Identifiable {
             remoteKeyboardActive = (await props("remotekeyboard", "remotekeyboard"))["remoteState"]?.bool ?? false
         }
         if has("mprisremote") { await refreshMedia() }
-        if has("notifications") { await refreshNotifications() }
+        // Notifications come and go as signals; the full list is read when the phone (re)connects.
+        if firstLoad, has("notifications") { await refreshNotifications() }
         if firstLoad {
             if has("contacts") {
                 loadContacts()
@@ -412,6 +422,7 @@ final class Device: Identifiable {
             announcedName = body.first?.string ?? announcedName
             name = DeviceNicknames.get(id) ?? announcedName
         case (nil, "pluginsChanged"), (nil, "linksChanged"), (nil, "statusIconNameChanged"), (nil, "typeChanged"):
+            if member == "pluginsChanged" { pluginStateStale = true }
             Task { await refresh() }
         case (nil, "pairingFailed"): lastError = "Pairing failed: " + (body.first?.string ?? "")
         case (nil, "conversationCreated"), (nil, "conversationUpdated"):
@@ -638,7 +649,7 @@ final class Device: Identifiable {
             m.title = media.title; m.artist = media.artist; m.album = media.album
             m.artURL = m.artURL ?? media.artURL
         }
-        media = m
+        if media != m { media = m }   // unchanged state doesn't redraw the views showing it
     }
 
     func mediaAction(_ action: String) {
@@ -711,12 +722,13 @@ final class Device: Identifiable {
     @ObservationIgnored private var liveEnding: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var livePoll: Task<Void, Never>?
 
-    /// The engine updates a notification in place without announcing it (no notificationUpdated signal),
-    /// so pause/resume/new ETA would be missed. While anything is live, re-read those few objects each second.
-    private func watchLive() {
-        guard livePoll == nil else { return }
+    /// The phone re-sends a live activity whenever it changes (cancel + repost), which arrives as signals. As a safety
+    /// net for an in-place update the engine wouldn't announce, the few live objects are re-read every 5 s, only while
+    /// the panel or main window shows them; nothing runs while hidden.
+    func watchLive() {
+        guard livePoll == nil, !live.isEmpty, AppModel.uiVisible else { return }
         livePoll = Task { [weak self] in
-            while let self, !self.live.isEmpty, !Task.isCancelled {
+            while let self, !self.live.isEmpty, AppModel.uiVisible, !Task.isCancelled {
                 for id in self.live.map(\.id) where self.liveEnding[id] == nil {
                     let p = (try? await self.bus.getAllProperties(destination: KDEConnectEngine.service,
                                                                    path: self.path + "/notifications/" + id,
@@ -726,7 +738,7 @@ final class Device: Identifiable {
                         self.upsertLive(id: id, json: text, iconPath: p["iconPath"]?.string.flatMap { $0.isEmpty ? nil : $0 }, via: "poll")
                     }
                 }
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(for: .seconds(5), tolerance: .seconds(1))
             }
             self?.livePoll = nil
         }

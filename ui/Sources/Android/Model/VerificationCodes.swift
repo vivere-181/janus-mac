@@ -4,6 +4,8 @@ import Foundation
 /// Finds one-time codes in SMS and notification text (wording in many languages) while ignoring amounts in any
 /// currency, card numbers, dates and phone numbers.
 enum CodeDetector {
+    /// Candidates: 4–8 digits, or two 3-digit groups ("123 456", "123-456"), or G-123456 style (compiled once).
+    private static let candidateRegex = try! NSRegularExpression(pattern: #"(?<![\w*+/$€£₾])(?<!\d[.,])(?:[A-Z]{1,3}-)?(\d{3}[ -]\d{3}|\d{4,8})(?!\w|[.,]\d|%|/\d|-\d|:\d)"#)
     /// Words that mark a message as carrying a one-time code.
     static let keywords: [String] = [
         "code", "passcode", "password", "otp", "pin", "verification", "verify", "security code",
@@ -36,8 +38,7 @@ enum CodeDetector {
         guard !keywordPositions.isEmpty else { return nil }
 
         // Candidates: 4–8 digits, or two 3-digit groups ("123 456", "123-456"), or G-123456 style.
-        let pattern = #"(?<![\w*+/$€£₾])(?<!\d[.,])(?:[A-Z]{1,3}-)?(\d{3}[ -]\d{3}|\d{4,8})(?!\w|[.,]\d|%|/\d|-\d|:\d)"#
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let re = Self.candidateRegex
         let ns = text as NSString
         var best: (code: String, distance: Int)?
         for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {

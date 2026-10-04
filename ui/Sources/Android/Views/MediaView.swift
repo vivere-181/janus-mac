@@ -69,7 +69,7 @@ struct MediaView: View {
     }
 
     private var progress: some View {
-        TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+        TimelineView(PlaybackTicks(device.media, running: scrubbing == nil)) { ctx in
             let m = device.media
             let pos = scrubbing ?? Double(m.currentPosition(at: ctx.date))
             VStack(spacing: 2) {
@@ -98,7 +98,7 @@ enum ColorWash {
     @MainActor static func image(for url: URL?) -> NSImage? {
         guard let url else { return nil }
         if let hit = cache[url] { return hit }
-        guard let src = NSImage(contentsOf: url)?.cgImage(forProposedRect: nil, context: nil, hints: nil),
+        guard let src = ImageCache.file(url.path, points: 32)?.cgImage(forProposedRect: nil, context: nil, hints: nil),
               let ctx = CGContext(data: nil, width: 6, height: 6, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }

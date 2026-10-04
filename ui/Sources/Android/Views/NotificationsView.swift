@@ -177,7 +177,7 @@ struct NotificationRow: View {
                     }
                     Spacer()
                     if !compact {
-                        TimelineView(.periodic(from: .now, by: 60)) { _ in
+                        TimelineView(.everyMinute) { _ in
                             Text(Self.age(n.postedAt)).font(.caption).foregroundStyle(.tertiary)
                         }
                     }
@@ -224,7 +224,7 @@ struct NotificationRow: View {
     }
 
     @ViewBuilder private var icon: some View {
-        if let p = notification.iconPath, let img = NSImage(contentsOfFile: p.replacingOccurrences(of: "file://", with: "")) {
+        if let img = ImageCache.file(notification.iconPath, points: 34) {
             Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
         } else {

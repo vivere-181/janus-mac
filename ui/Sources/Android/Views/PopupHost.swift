@@ -51,6 +51,7 @@ final class PopupHost: NSObject, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         popover?.contentViewController = nil
         popover = nil
+        anchorWindow?.orderOut(nil)
     }
 
     /// Our menu bar button, or (when the menu bar hides it) an invisible 2×1 pt window where it would be.

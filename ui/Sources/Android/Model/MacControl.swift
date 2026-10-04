@@ -167,7 +167,11 @@ enum MacState {
         pending = Task {
             try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled else { return }
-            for device in MacActions.ourPhones where lastSent[device.id] != text { send(to: device) }
+            let current = text   // (several CoreAudio queries: worked out once for all phones)
+            for device in MacActions.ourPhones where lastSent[device.id] != current {
+                lastSent[device.id] = current
+                device.command("macstate:" + current)
+            }
         }
     }
 

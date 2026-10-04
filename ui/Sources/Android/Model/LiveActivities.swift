@@ -82,7 +82,7 @@ struct LiveActivity: Identifiable, Equatable {
     }
 
     var icon: NSImage? {
-        iconPath.flatMap { NSImage(contentsOfFile: $0.replacingOccurrences(of: "file://", with: "")) }
+        ImageCache.file(iconPath, points: 40)
     }
 }
 

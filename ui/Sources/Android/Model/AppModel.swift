@@ -110,24 +110,42 @@ final class AppModel {
         Notifier.shared.setup(model: self)
         Task { await connect() }
         startReliabilityMonitors()
-        // Measure round-trip latency: every 10 s while it's on screen, otherwise every 2 min.
-        // Each ping wakes the phone's Wi-Fi, so it isn't done more often than someone can see.
-        Task { [weak self] in
-            var lastPing = Date.distantPast
-            while true {
-                guard let self else { return }
-                let visible = StatusItemController.shared.isPanelShown || DockPresence.mainWindowVisible
-                if Date().timeIntervalSince(lastPing) >= (visible ? 10 : 120) {
-                    lastPing = .now
-                    for d in self.connectedDevices {
-                        if let ip = d.addresses.first(where: { !$0.contains(":") }) ?? d.addresses.first {
-                            d.recordLatency(await Latency.ping(ip))
-                        }
+        // The main window hidden behind others or on another Space counts as not visible.
+        NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main) { n in
+            guard (n.object as? NSWindow)?.identifier?.rawValue == "main" else { return }
+            MainActor.assumeIsolated { AppModel.shared.uiVisibilityChanged() }
+        }
+    }
+
+    // MARK: Work that only matters on screen
+
+    /// The panel or the main window is showing (latency, live progress and the like are only worth refreshing then).
+    static var uiVisible: Bool { StatusItemController.shared.isPanelShown || DockPresence.mainWindowVisible }
+
+    @ObservationIgnored private var latencyTask: Task<Void, Never>?
+
+    /// Called when the panel or main window shows or hides. While hidden nothing here runs at all.
+    func uiVisibilityChanged() {
+        guard Self.uiVisible else { return }   // the loops end themselves once hidden
+        startLatencyLoop()
+        for d in connectedDevices { d.watchLive() }
+    }
+
+    /// Round-trip latency, every 10 s and only while on screen: each ping wakes the phone's Wi-Fi.
+    private func startLatencyLoop() {
+        guard latencyTask == nil else { return }
+        latencyTask = Task { [weak self] in
+            while let self, Self.uiVisible, !Task.isCancelled {
+                for d in self.connectedDevices {
+                    if let ip = d.addresses.first(where: { !$0.contains(":") }) ?? d.addresses.first {
+                        d.recordLatency(await Latency.ping(ip))
                     }
-                    self.macAddresses = Latency.localIPv4Addresses()
                 }
-                try? await Task.sleep(for: .seconds(10))
+                let addresses = Latency.localIPv4Addresses()
+                if addresses != self.macAddresses { self.macAddresses = addresses }
+                try? await Task.sleep(for: .seconds(10), tolerance: .seconds(2))
             }
+            self?.latencyTask = nil
         }
     }
 
@@ -241,6 +259,24 @@ final class AppModel {
         guard let bus else { throw DBusError(name: "Disconnected", message: "Not connected") }
         return try await bus.call(destination: KDEConnectEngine.service, path: KDEConnectEngine.daemonPath,
                                   interface: "org.kde.kdeconnect.daemon", member: member, args)
+    }
+
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var refreshAgain = false
+
+    /// Device signals come in bursts (a phone connecting sends several): they share one refresh, 0.2 s later, and a
+    /// refresh never runs twice at once (one more follows if something arrived meanwhile).
+    func requestRefresh() {
+        if refreshTask != nil { refreshAgain = true; return }
+        refreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard let self else { return }
+            repeat {
+                self.refreshAgain = false
+                await self.refreshDevices()
+            } while self.refreshAgain
+            self.refreshTask = nil
+        }
     }
 
     func refreshDevices() async {
@@ -418,7 +454,7 @@ final class AppModel {
         if path == KDEConnectEngine.daemonPath {
             switch member {
             case "deviceAdded", "deviceRemoved", "deviceListChanged", "deviceVisibilityChanged", "pairingRequestsChanged":
-                Task { await refreshDevices() }
+                requestRefresh()
             case "announcedNameChanged":
                 announcedName = msg.body.first?.string ?? announcedName
             case "linkProvidersChanged":
@@ -431,12 +467,12 @@ final class AppModel {
         guard path.hasPrefix(prefix) else { return }
         let rest = path.dropFirst(prefix.count).split(separator: "/", maxSplits: 1).map(String.init)
         guard let device = devices.first(where: { $0.id == rest[0] }) else {
-            Task { await refreshDevices() }
+            requestRefresh()
             return
         }
         device.handle(member: member, interface: msg.interface ?? "", subpath: rest.count > 1 ? rest[1] : nil, body: msg.body)
         if member == "pairStateChanged" || member == "reachableChanged" {
-            Task { await refreshDevices() }
+            requestRefresh()
         }
     }
 }

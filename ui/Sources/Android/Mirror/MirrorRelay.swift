@@ -64,7 +64,7 @@ final class MirrorRelay: @unchecked Sendable {
         pump(from: inbound, to: outbound)
         pump(from: outbound, to: inbound)
         outbound.stateUpdateHandler = { [weak self] state in
-            self?.lastOutboundState += " → \(state)"
+            if let self { self.lastOutboundState = String((self.lastOutboundState + " → \(state)").suffix(300)) }
             if case .failed = state { inbound.cancel() }
         }
     }

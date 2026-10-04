@@ -3,15 +3,42 @@ import SwiftUI
 
 struct MainWindow: View {
     @Environment(AppModel.self) private var model
+    /// SwiftUI keeps a closed window (and every view in it) alive, still updating for changes nobody can see. The
+    /// section's view is released when it closes and built again as it reopens (the sidebar stays).
+    @State private var open = true
 
     var body: some View {
+        panes
+        .onAppear { DispatchQueue.main.async { DockPresence.update() } }
+        .onDisappear { DispatchQueue.main.async { DockPresence.update() } }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+            if (note.object as? NSWindow)?.identifier?.rawValue == "main" {
+                open = false
+                DispatchQueue.main.async { NSApp.setActivationPolicy(.accessory) }
+            }
+        }
+        // Back before it's drawn: becoming key happens while the window is ordered in.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            if !open, (note.object as? NSWindow)?.identifier?.rawValue == "main" { open = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
+            if !open, let w = note.object as? NSWindow, w.identifier?.rawValue == "main", w.isVisible { open = true }
+        }
+    }
+
+    private var panes: some View {
         @Bindable var model = model
-        NavigationSplitView {
+        return NavigationSplitView {
+            // The minimum must fit the sidebar's toolbar (Settings, Reconnect, sidebar toggle). SwiftUI rebuilds the
+            // toolbar each time the window reopens, and AppKit's first layout of it needs ~228 pt; narrower, Reconnect
+            // goes into the » overflow and stays there until the sidebar is resized.
             Sidebar()
-                .navigationSplitViewColumnWidth(min: 210, ideal: 230, max: 280)
+                .navigationSplitViewColumnWidth(min: 232, ideal: 240, max: 280)
         } detail: {
             Group {
-                if model.section == .settings {
+                if !open {
+                    Color.clear
+                } else if model.section == .settings {
                     SettingsPane()
                 } else if model.section == .testing {
                     TestingPane()
@@ -50,13 +77,6 @@ struct MainWindow: View {
         .overlay(alignment: .top) { PairingBanner() }
         .tint(.janus)   // Janus navy for selections, buttons and controls (R32)
         .sheet(isPresented: $model.showAddDevice) { AddDeviceSheet().environment(model) }
-        .onAppear { DispatchQueue.main.async { DockPresence.update() } }
-        .onDisappear { DispatchQueue.main.async { DockPresence.update() } }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
-            if (note.object as? NSWindow)?.identifier?.rawValue == "main" {
-                DispatchQueue.main.async { NSApp.setActivationPolicy(.accessory) }
-            }
-        }
     }
 }
 

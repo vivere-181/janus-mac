@@ -24,17 +24,7 @@ extension AppModel {
         events.insert(event, at: 0)
         if events.count > 100 { events.removeLast(events.count - 100) }
         let line = "\(ISO8601DateFormatter.string(from: event.date, timeZone: .current, formatOptions: [.withInternetDateTime])) [\(kind)] \(text)\n"
-        if let h = try? FileHandle(forWritingTo: Self.logURL) {
-            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
-            // Keep the file small: trim to the last ~2000 lines when it passes 256 KB.
-            if let size = try? FileManager.default.attributesOfItem(atPath: Self.logURL.path)[.size] as? Int, size > 256_000,
-               let text = try? String(contentsOf: Self.logURL, encoding: .utf8) {
-                try? text.split(separator: "\n").suffix(2000).joined(separator: "\n").appending("\n")
-                    .write(to: Self.logURL, atomically: true, encoding: .utf8)
-            }
-        } else {
-            try? line.write(to: Self.logURL, atomically: true, encoding: .utf8)
-        }
+        LogFile.append(line, to: Self.logURL)
     }
 
     func startReliabilityMonitors() {
@@ -76,27 +66,41 @@ extension AppModel {
         monitor.start(queue: DispatchQueue(label: "android.path-monitor"))
         pathMonitor = monitor
 
-        // Every 30 s: make sure the engine is alive, and keep announcing while the phone is missing.
+        // A safety net (the engine's exit, the network, wake and unlock are all events already): makes sure the engine
+        // is alive and re-announces while a phone is missing, backing off so an absent phone costs next to nothing.
         Task { [weak self] in
+            var delay = 30.0
             while true {
-                try? await Task.sleep(for: .seconds(30))
+                try? await Task.sleep(for: .seconds(delay), tolerance: .seconds(delay / 5))
                 guard let self else { return }
-                await self.watchdogTick()
+                delay = await self.watchdogTick(previous: delay)
             }
         }
     }
 
-    private func watchdogTick() async {
+    /// One check; returns how long to wait before the next: 5 min when every paired phone is connected, while one is
+    /// missing 30 s → 1 → 2 → 5 min, 30 s while the engine connection itself is down.
+    private static var missingChecksStorage = 0
+    private var missingChecks: Int {
+        get { Self.missingChecksStorage }
+        set { Self.missingChecksStorage = newValue }
+    }
+
+    private func watchdogTick(previous: Double) async -> Double {
         switch state {
         case .connected:
             if !KDEConnectEngine.isDaemonRunning {
                 log(.warning, "The connection engine isn't running; starting it")
                 await restartEngine()
-            } else if !pairedDevices.isEmpty, connectedDevices.isEmpty {
-                refreshNetwork()
+                return 30
             }
+            guard !pairedDevices.isEmpty, connectedDevices.count < pairedDevices.count else { missingChecks = 0; return 300 }
+            refreshNetwork()
+            missingChecks += 1
+            return [30.0, 60, 120, 300][min(missingChecks - 1, 3)]
         case .failed, .connecting:
             await connect()
+            return 30
         }
     }
 
@@ -116,7 +120,7 @@ extension AppModel {
             }
             guard let self, !Task.isCancelled else { return }
             if self.connectedDevices.isEmpty, !self.pairedDevices.isEmpty {
-                self.log(.warning, "Phone still not found after \(reason); will keep checking every 30 s")
+                self.log(.warning, "Phone still not found after \(reason); will keep checking, less often over time")
             }
         }
     }
@@ -145,6 +149,32 @@ extension AppModel {
             log(.info, "Set to open at login")
         } catch {
             log(.warning, "Couldn't turn on Open at Login automatically (\(error.localizedDescription)). Turn it on in Settings.")
+        }
+    }
+}
+
+
+/// The event log on disk, written off the main thread through one open file; trimmed to the last ~2000 lines when it
+/// passes 256 KB (checked every 100 lines).
+enum LogFile {
+    private static let queue = DispatchQueue(label: "janus.log", qos: .utility)
+    nonisolated(unsafe) private static var handle: FileHandle?
+    nonisolated(unsafe) private static var written = 0
+
+    static func append(_ line: String, to url: URL) {
+        queue.async {
+            if handle == nil {
+                if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+                handle = try? FileHandle(forWritingTo: url)
+                _ = try? handle?.seekToEnd()
+            }
+            try? handle?.write(contentsOf: Data(line.utf8))
+            written += 1
+            guard written % 100 == 0,
+                  let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int, size > 256_000,
+                  let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+            try? handle?.close(); handle = nil
+            try? text.split(separator: "\n").suffix(2000).joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
         }
     }
 }

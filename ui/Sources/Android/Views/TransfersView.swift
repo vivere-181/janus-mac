@@ -317,15 +317,25 @@ struct PreviewImage: View {
         .task(id: transfer.state) { await loadThumbnail() }
     }
 
+    /// Made at the size it's shown (a 32 pt tile doesn't need a 1000 px picture) and kept in a small shared cache, so
+    /// reopening the panel doesn't make them again.
     private func loadThumbnail() async {
-        guard transfer.kind == .file, transfer.state == .done, let url = transfer.url,
-              FileManager.default.fileExists(atPath: url.path) else { return }
-        let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 520, height: 320),
+        guard transfer.kind == .file, transfer.state == .done, let url = transfer.url else { return }
+        let size = compact ? CGSize(width: 64, height: 64) : CGSize(width: 280, height: 180)
+        let key = "\(url.path)|\(Int(size.width))" as NSString
+        if let cached = Self.cache.object(forKey: key) { thumbnail = cached; return }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let request = QLThumbnailGenerator.Request(fileAt: url, size: size,
                                                    scale: NSScreen.main?.backingScaleFactor ?? 2, representationTypes: .thumbnail)
         if let rep = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request) {
-            thumbnail = rep.nsImage
+            let image = rep.nsImage
+            Self.cache.setObject(image, forKey: key, cost: Int(image.size.width * image.size.height * 4 * 4))
+            thumbnail = image
         }
     }
+
+    /// About 16 MB of thumbnails at most; macOS empties it under memory pressure.
+    private static let cache: NSCache<NSString, NSImage> = { let c = NSCache<NSString, NSImage>(); c.totalCostLimit = 16 << 20; return c }()
 }
 
 /// A progress bar whose filled part is a gently moving wave; indeterminate when the total is unknown.
@@ -333,7 +343,7 @@ struct WavyProgress: View {
     let progress: Double?
 
     var body: some View {
-        TimelineView(.animation) { ctx in
+        TimelineView(.animation(minimumInterval: 1.0 / 30)) { ctx in   // a gentle wave doesn't need the display's full rate
             let phase = ctx.date.timeIntervalSinceReferenceDate * 4
             GeometryReader { geo in
                 let w = geo.size.width, h = geo.size.height

@@ -113,6 +113,8 @@ private struct ThreadView: View {
     private var header: SMSMessage? { device.conversations[thread] }
 
     var body: some View {
+        // Sorted once per update (each row compares with the one before it).
+        let messages = self.messages
         VStack(spacing: 0) {
             ScrollView {
                 LazyVStack(spacing: 4) {
@@ -202,7 +204,7 @@ private struct Bubble: View {
                     Text(device.contact(for: a)?.name ?? a).font(.caption2).foregroundStyle(.secondary).padding(.leading, 10)
                 }
                 ForEach(message.attachments) { att in
-                    if let data = att.thumbnail, let img = NSImage(data: data) {
+                    if let img = ImageCache.data(att.thumbnail, points: 220) {
                         Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
                             .frame(maxWidth: 220, maxHeight: 220)
                             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))

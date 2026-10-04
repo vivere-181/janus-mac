@@ -7,13 +7,26 @@ import SwiftUI
 enum NotificationText {
     private static let tagPattern = #"<(/?)(b|strong|i|em|u|s|strike|del|br|p|div|span|font|small|big|a|li|ul|ol|tt|code|blockquote)\b([^>]*)>"#
     private static let tagRegex = try! NSRegularExpression(pattern: tagPattern, options: [.caseInsensitive])
+    private static let entityRegex = try? NSRegularExpression(pattern: #"&#(x[0-9a-fA-F]+|[0-9]+);"#)
 
     static func isHTML(_ s: String) -> Bool {
         s.contains("<") && tagRegex.firstMatch(in: s, range: NSRange(location: 0, length: (s as NSString).length)) != nil
     }
 
+    private final class Box { let value: AttributedString; init(_ v: AttributedString) { value = v } }
+    /// Views ask on every redraw; a notification's text is parsed once.
+    private static let parsed: NSCache<NSString, Box> = { let c = NSCache<NSString, Box>(); c.countLimit = 300; return c }()
+
     /// Bold, italic, underline, strikethrough, monospaced and links kept; breaks and paragraphs as line breaks.
     static func attributed(_ raw: String) -> AttributedString {
+        guard raw.contains("<") else { return AttributedString(raw) }
+        if let hit = parsed.object(forKey: raw as NSString) { return hit.value }
+        let value = parse(raw)
+        parsed.setObject(Box(value), forKey: raw as NSString)
+        return value
+    }
+
+    private static func parse(_ raw: String) -> AttributedString {
         guard isHTML(raw) else { return AttributedString(raw) }
         var out = AttributedString()
         var bold = 0, italic = 0, underline = 0, strike = 0, mono = 0
@@ -83,7 +96,7 @@ enum NotificationText {
             out = out.replacingOccurrences(of: e, with: c)
         }
         // Numeric entities: &#128591; &#x1F64F;
-        if let re = try? NSRegularExpression(pattern: #"&#(x[0-9a-fA-F]+|[0-9]+);"#) {
+        if let re = Self.entityRegex {
             let ns = out as NSString
             var result = ""
             var last = 0

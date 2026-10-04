@@ -118,9 +118,22 @@ enum DebugSnapshot {
         if name == "mediaplay", let d = model.selectedDevice { d.media.isPlaying = true; d.media.positionDate = .now; return }
         if name == "openpanel" { StatusItemController.shared.showPanel(); return }
         if name == "closepanel" { StatusItemController.shared.closePanel(); return }
+        if name == "windows" {
+            let lines = NSApp.windows.map { "\($0.identifier?.rawValue ?? "-") \(type(of: $0)) visible=\($0.isVisible) occluded=\(!$0.occlusionState.contains(.visible)) content=\($0.contentViewController.map { String(describing: type(of: $0)).prefix(60) } ?? "nil") frame=\($0.frame)" }
+            try? lines.joined(separator: "\n").write(to: dir.appendingPathComponent("windows.txt"), atomically: true, encoding: .utf8); return
+        }
         if name == "closemain" { NSApp.windows.first { $0.identifier?.rawValue == "main" }?.close(); return }
         if name == "wantmain" { model.wantsMainWindow = true; return }
         if name == "mediastop", let d = model.selectedDevice { d.media.isPlaying = false; return }
+        // fakemedia: a playing song with album art (the app's icon), to check the scrubber and art without the phone.
+        if name == "fakemedia", let d = model.selectedDevice {
+            var m = MediaState()
+            m.players = ["Spotify"]; m.player = "Spotify"; m.title = "Test Song"; m.artist = "Test Artist"; m.album = "Album"
+            m.artURL = Bundle.main.url(forResource: "Janus", withExtension: "icns")
+            m.length = 215_000; m.position = 61_400; m.positionDate = .now; m.isPlaying = true; m.canSeek = true; m.volume = 50
+            d.media = m; return
+        }
+        if name == "nomedia", let d = model.selectedDevice { d.media = MediaState(); return }
         if name == "alignstop" {
             model.selectedDevice?.media.isPlaying = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.85) {
@@ -328,6 +341,26 @@ enum DebugSnapshot {
             let w = NSWindow(contentViewController: host)
             w.setContentSize(NSSize(width: 560, height: 640)); w.center(); w.orderFrontRegardless()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { debugCapture(w, "noterender"); w.close() }
+            return
+        }
+        // notesperf: typing speed in a long note (600 lines of mixed formatting), per keystroke.
+        if name == "notesperf" {
+            let tv = NoteTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 800))
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 800), styleMask: [.titled], backing: .buffered, defer: false)
+            let scroll = NSScrollView(frame: w.contentView!.bounds); scroll.documentView = tv; w.contentView = scroll
+            var lines = ["Long note"]
+            for i in 0..<100 { lines += ["## Section \(i)", "Some **bold** and *italic* text with a [link](https://example.com) and `code`.",
+                                         "- [ ] task \(i)", "\t- nested bullet", "1. numbered", "> quote line"] }
+            tv.string = lines.joined(separator: "\n"); tv.restyle()
+            tv.setSelectedRange(NSRange(location: (tv.string as NSString).length / 2, length: 0))
+            let start = Date()
+            for _ in 0..<200 { tv.insertText("a", replacementRange: tv.selectedRange()) }
+            let typing = Date().timeIntervalSince(start) / 200 * 1000
+            let s2 = Date()
+            for _ in 0..<50 { tv.moveDown(nil) }
+            let moving = Date().timeIntervalSince(s2) / 50 * 1000
+            let s3 = Date(); tv.restyle(); let full = Date().timeIntervalSince(s3) * 1000
+            debugLog(String(format: "notesperf: %.2f ms per keystroke, %.2f ms per line move, %.1f ms full restyle (%d lines)", typing, moving, full, lines.count))
             return
         }
         // tableedits: Tab, Return, | and row/column commands in a table (logged).

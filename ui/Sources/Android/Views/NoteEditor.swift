@@ -10,6 +10,9 @@ struct NoteEditor: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
+    /// The editor going away (note closed, window closed): what was typed is handed over first.
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) { coordinator.flush() }
+
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NoteTextView.scrollableTextView()
         scroll.drawsBackground = false
@@ -43,7 +46,12 @@ struct NoteEditor: NSViewRepresentable {
         if arrived != context.coordinator.attachmentsVersion { context.coordinator.attachmentsVersion = arrived; tv.restyle() }
         tv.isEditable = editable
         let switched = context.coordinator.noteID != noteID
-        if switched || tv.string != text {
+        // Text typed here but not yet handed to the store belongs to the note it was typed in.
+        if switched { context.coordinator.flush() }
+        // Only a change from elsewhere (another device, a command) replaces the text; what's being typed wins.
+        let external = context.coordinator.pending == nil && text != context.coordinator.lastPushed
+        if switched || external {
+            context.coordinator.lastPushed = text
             let caret = tv.selectedRange()
             tv.string = text
             if switched {
@@ -70,12 +78,33 @@ struct NoteEditor: NSViewRepresentable {
         weak var textView: NoteTextView?
         var noteID: String?
         var attachmentsVersion = 0
+        /// The text last handed to the store, and an edit waiting to be (with the binding of the note it belongs to).
+        var lastPushed: String?
+        var pending: (task: Task<Void, Never>, binding: Binding<String>)?
         init(_ parent: NoteEditor) { self.parent = parent }
 
+        /// Typing reaches the store (and from there the list, the disk and the phone) once it pauses for 0.3 s.
         func textDidChange(_ notification: Notification) {
-            guard let tv = textView else { return }
-            if parent.text != tv.string { parent.text = tv.string }
+            pending?.task.cancel()
+            let binding = parent.$text
+            let task = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(300))
+                guard !Task.isCancelled else { return }
+                self?.flush()
+            }
+            pending = (task, pending?.binding ?? binding)
         }
+
+        func flush() {
+            guard let p = pending, let tv = textView else { pending = nil; return }
+            p.task.cancel()
+            pending = nil
+            let text = tv.string
+            lastPushed = text
+            if p.binding.wrappedValue != text { p.binding.wrappedValue = text }
+        }
+
+        func textDidEndEditing(_ notification: Notification) { flush() }
 
         func textViewDidChangeSelection(_ notification: Notification) {
             textView?.caretMoved()
@@ -106,6 +135,24 @@ struct MDLine {
 }
 
 enum Markdown {
+    /// Patterns are compiled once (they ran on every line of every keystroke before).
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cache: [String: NSRegularExpression] = [:]
+    static func re(_ pattern: String) -> NSRegularExpression {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if let r = cache[pattern] { return r }
+        let r = try! NSRegularExpression(pattern: pattern)
+        cache[pattern] = r
+        return r
+    }
+    /// The first match of a pattern in a string, as a String range.
+    static func match(_ pattern: String, _ s: String) -> Range<String.Index>? {
+        re(pattern).firstMatch(in: s, range: NSRange(s.startIndex..., in: s)).flatMap { Range($0.range, in: s) }
+    }
+    static func replacing(_ pattern: String, in s: String, with template: String) -> String {
+        re(pattern).stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: template)
+    }
+
     static func lines(_ s: NSString) -> [MDLine] {
         var out: [MDLine] = []
         var inCode = false
@@ -124,29 +171,33 @@ enum Markdown {
             let rest = line.substring(from: tabs)
             var l = MDLine(range: r, kind: .body, tabs: tabs)
             func marker(_ n: Int) -> NSRange { NSRange(location: r.location + tabs, length: n) }
+            // Only lines starting with a marker character can be anything but body text (most lines skip the patterns).
+            let first = rest.first
             if trimmed.isEmpty {
                 l.kind = .blank
-            } else if tabs == 0, let m = rest.range(of: #"^!\[((?:\\.|[^\]])*)\]\(attachments/([0-9a-f]{64}\.[a-z0-9]{1,8})\)$"#, options: .regularExpression) {
+            } else if first == "!", tabs == 0, let m = match(#"^!\[((?:\\.|[^\]])*)\]\(attachments/([0-9a-f]{64}\.[a-z0-9]{1,8})\)$"#, rest) {
                 let whole = String(rest[m])
-                let name = String(whole[whole.range(of: #"[0-9a-f]{64}\.[a-z0-9]{1,8}"#, options: .regularExpression)!])
-                let label = whole.replacingOccurrences(of: #"^!\[|\]\(attachments/.*$"#, with: "", options: .regularExpression)
+                let name = String(whole[match(#"[0-9a-f]{64}\.[a-z0-9]{1,8}"#, whole)!])
+                let label = replacing(#"^!\[|\]\(attachments/.*$"#, in: whole, with: "")
                 l.kind = .attachment(name, Markdown.unescape(label))
-            } else if let m = rest.range(of: #"^[-*+] \[( |x|X)\] "#, options: .regularExpression) {
-                let n = rest.distance(from: rest.startIndex, to: m.upperBound)
-                l.kind = .check(rest[m].contains("x") || rest[m].contains("X")); l.marker = marker(n)
-            } else if let m = rest.range(of: #"^[-*+] "#, options: .regularExpression) {
-                l.kind = .bullet; l.marker = marker(rest.distance(from: rest.startIndex, to: m.upperBound))
-            } else if let m = rest.range(of: #"^\d{1,9}[.)] "#, options: .regularExpression) {
+            } else if first == "-" || first == "*" || first == "+" {
+                if let m = match(#"^[-*+] \[( |x|X)\] "#, rest) {
+                    let n = rest.distance(from: rest.startIndex, to: m.upperBound)
+                    l.kind = .check(rest[m].contains("x") || rest[m].contains("X")); l.marker = marker(n)
+                } else if let m = match(#"^[-*+] "#, rest) {
+                    l.kind = .bullet; l.marker = marker(rest.distance(from: rest.startIndex, to: m.upperBound))
+                }
+            } else if first?.isNumber == true, let m = match(#"^\d{1,9}[.)] "#, rest) {
                 l.kind = .numbered(Int(rest[m].prefix { $0.isNumber }) ?? 1)
                 l.marker = marker(rest.distance(from: rest.startIndex, to: m.upperBound))
-            } else if let m = rest.range(of: #"^> ?"#, options: .regularExpression) {
+            } else if first == ">", let m = match(#"^> ?"#, rest) {
                 l.kind = .quote; l.marker = marker(rest.distance(from: rest.startIndex, to: m.upperBound))
-            } else if let m = rest.range(of: #"^#{1,6} "#, options: .regularExpression) {
+            } else if first == "#", let m = match(#"^#{1,6} "#, rest) {
                 let n = rest.distance(from: rest.startIndex, to: m.upperBound)
                 l.kind = .heading(min(n - 1, 3)); l.marker = marker(n)
             }
             if tabs == 0, trimmed.hasPrefix("|") {
-                l.kind = trimmed.range(of: #"^\|(\s*:?-{3,}:?\s*\|)+\s*$"#, options: .regularExpression) != nil ? .tableRule : .tableRow
+                l.kind = match(#"^\|(\s*:?-{3,}:?\s*\|)+\s*$"#, trimmed) != nil ? .tableRule : .tableRow
                 l.marker = nil
             }
             if !titleFound, l.kind != .blank {
@@ -187,26 +238,28 @@ enum Markdown {
     static func plain(_ line: String) -> String {
         var s = line.trimmingCharacters(in: .whitespaces)
         if s.hasPrefix("```") { return "" }
-        if let r = s.range(of: #"^!\[((?:\\.|[^\]])*)\]\(attachments/[^)]+\)$"#, options: .regularExpression) {
-            let name = String(s[r]).replacingOccurrences(of: #"^!\[|\]\(.*$"#, with: "", options: .regularExpression)
+        if s.hasPrefix("!["), let r = match(#"^!\[((?:\\.|[^\]])*)\]\(attachments/[^)]+\)$"#, s) {
+            let name = replacing(#"^!\[|\]\(.*$"#, in: String(s[r]), with: "")
             return "📎 " + unescape(name)
         }
-        for p in [#"^[-*+] \[[ xX]\] "#, #"^[-*+] "#, #"^\d{1,9}[.)] "#, #"^> ?"#, #"^#{1,6} "#] {
-            if let r = s.range(of: p, options: .regularExpression) { s.removeSubrange(r); break }
+        if let f = s.first, "-*+>#".contains(f) || f.isNumber {
+            for p in [#"^[-*+] \[[ xX]\] "#, #"^[-*+] "#, #"^\d{1,9}[.)] "#, #"^> ?"#, #"^#{1,6} "#] {
+                if let r = match(p, s) { s.removeSubrange(r); break }
+            }
         }
         if s.hasPrefix("|") {   // a table row: its cells
-            let cells = s.replacingOccurrences(of: #"(?<!\\)\|"#, with: "\u{1F}", options: .regularExpression).split(separator: "\u{1F}")
+            let cells = replacing(#"(?<!\\)\|"#, in: s, with: "\u{1F}").split(separator: "\u{1F}")
             return cells.map { unescape($0.trimmingCharacters(in: .whitespaces)) }
                 .filter { !$0.isEmpty && !$0.allSatisfy { "-: ".contains($0) } }.joined(separator: " · ")
         }
-        s = s.replacingOccurrences(of: #"\[([^\]]*)\]\((?:<[^>]*>|[^)]*)\)"#, with: "$1", options: .regularExpression)
-        for m in ["**", "~~", "`"] { s = s.replacingOccurrences(of: m, with: "") }
-        s = s.replacingOccurrences(of: #"(?<![\\\w])\*(?=\S)(.+?)(?<=\S)\*"#, with: "$1", options: .regularExpression)
+        if s.contains("](") { s = replacing(#"\[([^\]]*)\]\((?:<[^>]*>|[^)]*)\)"#, in: s, with: "$1") }
+        for m in ["**", "~~", "`"] where s.contains(m) { s = s.replacingOccurrences(of: m, with: "") }
+        if s.contains("*") { s = replacing(#"(?<![\\\w])\*(?=\S)(.+?)(?<=\S)\*"#, in: s, with: "$1") }
         return unescape(s)
     }
 
     static func unescape(_ s: String) -> String {
-        s.replacingOccurrences(of: #"\\([\\`*_{}\[\]()#+\-.!|>~])"#, with: "$1", options: .regularExpression)
+        s.contains("\\") ? replacing(#"\\([\\`*_{}\[\]()#+\-.!|>~])"#, in: s, with: "$1") : s
     }
 }
 
@@ -223,25 +276,65 @@ final class NoteTextView: NSTextView {
 
     private(set) var parsed: [MDLine] = []
 
-    /// Every change (typing, commands, undo) restyles, so the parsed lines always match the text.
+    /// The edit about to happen: where, and whether it can change other lines' styling (code fences, tables, the
+    /// title line) and so needs a full restyle.
+    private var pendingEdit: (range: NSRange, structural: Bool)?
+
+    override func shouldChangeText(in range: NSRange, replacementString text: String?) -> Bool {
+        guard super.shouldChangeText(in: range, replacementString: text) else { return false }
+        let s = string as NSString
+        let removed = range.length > 0 && range.upperBound <= s.length ? s.substring(with: range) : ""
+        let touched = removed + (text ?? "")
+        let titleEnd = parsed.first(where: \.isTitle)?.range.upperBound ?? 0
+        let structural = pendingEdit != nil || touched.contains("`") || touched.contains("|") || range.location <= titleEnd
+        pendingEdit = (NSRange(location: range.location, length: (text.map { ($0 as NSString).length } ?? 0)), structural)
+        return true
+    }
+
+    /// Every change (typing, commands, undo) restyles what it touched, so the parsed lines always match the text.
     override func didChangeText() {
-        restyle()
+        if let edit = pendingEdit, !edit.structural {
+            let fresh = Markdown.lines(string as NSString)
+            let lo = max(0, edit.range.location - 1), hi = edit.range.upperBound + 1
+            var targets = Set(fresh.indices.filter { fresh[$0].range.upperBound >= lo && fresh[$0].range.location <= hi })
+            if revealedLine >= 0 { targets.insert(min(revealedLine, fresh.count - 1)) }
+            restyle(lines: targets)
+        } else {
+            restyle()
+        }
+        pendingEdit = nil
         super.didChangeText()
     }
     private var revealedLine = -1
 
+    /// The line containing (or ending at) a location: a binary search over the parsed lines.
     private func lineIndex(at location: Int) -> Int? {
-        parsed.firstIndex { NSLocationInRange(location, $0.range) || $0.range.upperBound == location }
+        var lo = 0, hi = parsed.count - 1
+        while lo <= hi {
+            let mid = (lo + hi) / 2, r = parsed[mid].range
+            if location < r.location { hi = mid - 1 }
+            else if location > r.upperBound { lo = mid + 1 }
+            else { return mid }
+        }
+        return nil
     }
 
-    /// The caret's line shows its syntax; restyle when it moves to another line.
+    /// The caret's line shows its syntax: when it moves to another line, those two lines restyle (and the fences of a
+    /// code block it enters or leaves).
     func caretMoved() {
         let i = lineIndex(at: selectedRange().location) ?? -1
-        if i != revealedLine { restyle() }
+        guard i != revealedLine else { return }
+        var targets: Set<Int> = [i, revealedLine]
+        for line in [i, revealedLine] where line >= 0 && line < parsed.count && [.code, .fence].contains(parsed[line].kind) {
+            targets.formUnion(codeBlock(around: line))
+        }
+        restyle(lines: targets)
     }
 
     // MARK: Styling
 
+    /// Restyles everything (a note loaded, the width changed, or an edit that changes structure: code fences, tables,
+    /// the title). Typing otherwise restyles only the lines it touched (`restyle(lines:)`).
     func restyle() {
         guard let storage = textStorage else { return }
         styledWidth = contentWidth
@@ -249,87 +342,124 @@ final class NoteTextView: NSTextView {
         parsed = Markdown.lines(s)
         let caretLine = lineIndex(at: selectedRange().location) ?? -1
         revealedLine = caretLine
-        // The code block the caret is in shows its fences.
-        var caretBlock: ClosedRange<Int>?
-        if caretLine >= 0, [.code, .fence].contains(parsed[caretLine].kind) { caretBlock = codeBlock(around: caretLine) }
-
+        let caretBlock = caretCodeBlock(caretLine)
         storage.beginEditing()
         let all = NSRange(location: 0, length: storage.length)
-        storage.setAttributes([.font: Self.bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph(0, 0)], range: all)
+        storage.setAttributes(baseAttributes, range: all)
         for (i, l) in parsed.enumerated() {
-            let reveal = i == caretLine
-            let lineWithBreak = NSRange(location: l.range.location, length: min(l.range.length + 1, s.length - l.range.location))
-            switch l.kind {
-            case .fence:
-                if caretBlock?.contains(i) == true {
-                    storage.addAttributes([.font: Self.codeFont, .foregroundColor: NSColor.tertiaryLabelColor], range: l.range)
-                } else {
-                    hide(lineWithBreak, in: storage)   // collapses the line
-                }
-                continue
-            case .code:
-                storage.addAttribute(.font, value: Self.codeFont, range: lineWithBreak)
-                storage.addAttribute(.paragraphStyle, value: paragraph(10, 10), range: lineWithBreak)
-                continue
-            default: break
-            }
-            // Indentation: each tab is one step (tab stops every 22 pt); wrapped lines align with the text.
-            let markerWidth: CGFloat = l.marker.map { width(s.substring(with: $0), Self.bodyFont) } ?? 0
-            let indent = CGFloat(l.tabs) * Self.indentStep
-            if l.tabs > 0 || l.isList || l.kind == .quote {
-                // The tabs themselves move the first line in; wrapped lines are indented to match.
-                storage.addAttribute(.paragraphStyle, value: paragraph(0, indent + markerWidth + (l.kind == .quote ? 8 : 0)), range: lineWithBreak)
-            }
-            switch l.kind {
-            case .heading(let level):
-                let font = l.isTitle || level == 1 ? Self.titleFont : level == 2 ? Self.headingFont : Self.subheadingFont
-                storage.addAttribute(.font, value: font, range: l.range)
-                if let m = l.marker { reveal ? faint(m, in: storage) : hide(m, in: storage) }
-            case .check(let checked):
-                if let m = l.marker {
-                    storage.addAttribute(.foregroundColor, value: NSColor.clear, range: m)   // the box is drawn here
-                    if checked {
-                        let rest = NSRange(location: m.upperBound, length: l.range.upperBound - m.upperBound)
-                        storage.addAttributes([.foregroundColor: NSColor.secondaryLabelColor,
-                                               .strikethroughStyle: NSUnderlineStyle.single.rawValue], range: rest)
-                        // "x" is wider than " ": narrow it so ticked and unticked items line up.
-                        storage.addAttribute(.kern, value: width(" ", Self.bodyFont) - width("x", Self.bodyFont),
-                                             range: NSRange(location: m.location + 3, length: 1))
-                    }
-                }
-            case .bullet:
-                if let m = l.marker { storage.addAttribute(.foregroundColor, value: NSColor.clear, range: NSRange(location: m.location, length: 1)) }
-            case .numbered:
-                if let m = l.marker { storage.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: m) }
-            case .quote:
-                if let m = l.marker { storage.addAttribute(.foregroundColor, value: NSColor.clear, range: m) }
-                storage.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor,
-                                     range: NSRange(location: l.content, length: l.range.upperBound - l.content))
-            case .body where l.isTitle:
-                storage.addAttribute(.font, value: Self.titleFont, range: l.range)
-            case .tableRule:
-                hide(lineWithBreak, in: storage)   // collapses the line, with no spacing of its own
-                let flat = NSMutableParagraphStyle(); flat.maximumLineHeight = 0.01; flat.paragraphSpacing = 0
-                storage.addAttribute(.paragraphStyle, value: flat, range: lineWithBreak)
-                continue
-            case .tableRow:
-                continue   // laid out per table below
-            case .attachment(let name, _):
-                // The line's text is hidden; the file is drawn in its place, as tall as the line is made.
-                hide(lineWithBreak, in: storage)
-                let h = AttachmentArt.height(name, width: contentWidth)
-                let p = NSMutableParagraphStyle(); p.minimumLineHeight = h; p.maximumLineHeight = h; p.paragraphSpacing = 8
-                storage.addAttribute(.paragraphStyle, value: p, range: lineWithBreak)
-                continue
-            default: break
-            }
-            styleInline(l, reveal: reveal, in: storage, s: s)
+            styleLine(i, l, reveal: i == caretLine, caretBlock: caretBlock, storage: storage, s: s)
         }
         layoutTables(in: storage, s: s)
         storage.endEditing()
-        // New text takes the style of where it's typed.
-        var typing: [NSAttributedString.Key: Any] = [.font: Self.bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph(0, 0)]
-        if caretLine >= 0 {
+        finishStyling(caretLine: caretLine)
+    }
+
+    /// Restyles only the given lines (by index in a fresh parse). Lines in a table restyle the whole note (columns
+    /// depend on every row).
+    func restyle(lines targets: Set<Int>) {
+        guard let storage = textStorage else { return }
+        let s = string as NSString
+        parsed = Markdown.lines(s)
+        let valid = targets.filter { $0 >= 0 && $0 < parsed.count }
+        if valid.contains(where: { [.tableRow, .tableRule].contains(parsed[$0].kind) }) { restyle(); return }
+        let caretLine = lineIndex(at: selectedRange().location) ?? -1
+        revealedLine = caretLine
+        let caretBlock = caretCodeBlock(caretLine)
+        storage.beginEditing()
+        for i in valid.sorted() {
+            let l = parsed[i]
+            let lineWithBreak = NSRange(location: l.range.location, length: min(l.range.length + 1, s.length - l.range.location))
+            storage.setAttributes(baseAttributes, range: lineWithBreak)
+            styleLine(i, l, reveal: i == caretLine, caretBlock: caretBlock, storage: storage, s: s)
+        }
+        storage.endEditing()
+        finishStyling(caretLine: caretLine)
+    }
+
+    private var baseAttributes: [NSAttributedString.Key: Any] {
+        [.font: Self.bodyFont, .foregroundColor: NSColor.labelColor, .paragraphStyle: paragraph(0, 0)]
+    }
+
+    /// The code block the caret is in shows its fences.
+    private func caretCodeBlock(_ caretLine: Int) -> ClosedRange<Int>? {
+        guard caretLine >= 0, caretLine < parsed.count, [.code, .fence].contains(parsed[caretLine].kind) else { return nil }
+        return codeBlock(around: caretLine)
+    }
+
+    /// One line's styling (on top of the base attributes).
+    private func styleLine(_ i: Int, _ l: MDLine, reveal: Bool, caretBlock: ClosedRange<Int>?, storage: NSTextStorage, s: NSString) {
+        let lineWithBreak = NSRange(location: l.range.location, length: min(l.range.length + 1, s.length - l.range.location))
+        switch l.kind {
+        case .fence:
+            if caretBlock?.contains(i) == true {
+                storage.addAttributes([.font: Self.codeFont, .foregroundColor: NSColor.tertiaryLabelColor], range: l.range)
+            } else {
+                hide(lineWithBreak, in: storage)   // collapses the line
+            }
+            return
+        case .code:
+            storage.addAttribute(.font, value: Self.codeFont, range: lineWithBreak)
+            storage.addAttribute(.paragraphStyle, value: paragraph(10, 10), range: lineWithBreak)
+            return
+        default: break
+        }
+        // Indentation: each tab is one step (tab stops every 22 pt); wrapped lines align with the text.
+        let markerWidth: CGFloat = l.marker.map { width(s.substring(with: $0), Self.bodyFont) } ?? 0
+        let indent = CGFloat(l.tabs) * Self.indentStep
+        if l.tabs > 0 || l.isList || l.kind == .quote {
+            // The tabs themselves move the first line in; wrapped lines are indented to match.
+            storage.addAttribute(.paragraphStyle, value: paragraph(0, indent + markerWidth + (l.kind == .quote ? 8 : 0)), range: lineWithBreak)
+        }
+        switch l.kind {
+        case .heading(let level):
+            let font = l.isTitle || level == 1 ? Self.titleFont : level == 2 ? Self.headingFont : Self.subheadingFont
+            storage.addAttribute(.font, value: font, range: l.range)
+            if let m = l.marker { reveal ? faint(m, in: storage) : hide(m, in: storage) }
+        case .check(let checked):
+            if let m = l.marker {
+                storage.addAttribute(.foregroundColor, value: NSColor.clear, range: m)   // the box is drawn here
+                if checked {
+                    let rest = NSRange(location: m.upperBound, length: l.range.upperBound - m.upperBound)
+                    storage.addAttributes([.foregroundColor: NSColor.secondaryLabelColor,
+                                           .strikethroughStyle: NSUnderlineStyle.single.rawValue], range: rest)
+                    // "x" is wider than " ": narrow it so ticked and unticked items line up.
+                    storage.addAttribute(.kern, value: width(" ", Self.bodyFont) - width("x", Self.bodyFont),
+                                         range: NSRange(location: m.location + 3, length: 1))
+                }
+            }
+        case .bullet:
+            if let m = l.marker { storage.addAttribute(.foregroundColor, value: NSColor.clear, range: NSRange(location: m.location, length: 1)) }
+        case .numbered:
+            if let m = l.marker { storage.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: m) }
+        case .quote:
+            if let m = l.marker { storage.addAttribute(.foregroundColor, value: NSColor.clear, range: m) }
+            storage.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor,
+                                 range: NSRange(location: l.content, length: l.range.upperBound - l.content))
+        case .body where l.isTitle:
+            storage.addAttribute(.font, value: Self.titleFont, range: l.range)
+        case .tableRule:
+            hide(lineWithBreak, in: storage)   // collapses the line, with no spacing of its own
+            let flat = NSMutableParagraphStyle(); flat.maximumLineHeight = 0.01; flat.paragraphSpacing = 0
+            storage.addAttribute(.paragraphStyle, value: flat, range: lineWithBreak)
+            return
+        case .tableRow:
+            return   // laid out per table below
+        case .attachment(let name, _):
+            // The line's text is hidden; the file is drawn in its place, as tall as the line is made.
+            hide(lineWithBreak, in: storage)
+            let h = AttachmentArt.height(name, width: contentWidth)
+            let p = NSMutableParagraphStyle(); p.minimumLineHeight = h; p.maximumLineHeight = h; p.paragraphSpacing = 8
+            storage.addAttribute(.paragraphStyle, value: p, range: lineWithBreak)
+            return
+        default: break
+        }
+        styleInline(l, reveal: reveal, in: storage, s: s)
+        }
+
+    /// New text takes the style of where it's typed.
+    private func finishStyling(caretLine: Int) {
+        var typing: [NSAttributedString.Key: Any] = baseAttributes
+        if caretLine >= 0, caretLine < parsed.count {
             let l = parsed[caretLine]
             if l.isTitle || l.kind == .heading(1) { typing[.font] = Self.titleFont }
             else if l.kind == .heading(2) { typing[.font] = Self.headingFont }
@@ -353,7 +483,7 @@ final class NoteTextView: NSTextView {
                     NSRange(location: body.upperBound, length: whole.upperBound - body.upperBound)].map(abs)
         }
         func each(_ pattern: String, _ body: (NSTextCheckingResult) -> Void) {
-            guard let re = try? NSRegularExpression(pattern: pattern) else { return }
+            let re = Markdown.re(pattern)
             re.enumerateMatches(in: text, range: NSRange(location: 0, length: (text as NSString).length)) { m, _, _ in if let m { body(m) } }
         }
         var codeSpans: [NSRange] = []
@@ -433,8 +563,8 @@ final class NoteTextView: NSTextView {
                 for (c, r) in cells.enumerated() {
                     storage.addAttribute(.foregroundColor, value: NSColor.clear, range: NSRange(location: r.location - 1, length: 1))
                     let cell = s.substring(with: r) as NSString
-                    let lead = cell.range(of: #"^\s*"#, options: .regularExpression).length
-                    let trail = lead == r.length ? 0 : cell.range(of: #"\s*$"#, options: .regularExpression).length
+                    let lead = Markdown.re(#"^\s*"#).firstMatch(in: cell as String, range: NSRange(location: 0, length: cell.length))?.range.length ?? 0
+                    let trail = lead == r.length ? 0 : Markdown.re(#"\s*$"#).firstMatch(in: cell as String, range: NSRange(location: 0, length: cell.length))?.range.length ?? 0
                     if lead > 0 { hide(NSRange(location: r.location, length: lead), in: storage) }
                     if trail > 0 { hide(NSRange(location: r.upperBound - trail, length: trail), in: storage) }
                     let textRange = NSRange(location: r.location + lead, length: max(0, r.length - lead - trail))
@@ -659,9 +789,12 @@ final class NoteTextView: NSTextView {
 
     override func drawBackground(in dirty: NSRect) {
         super.drawBackground(in: dirty)
+        // Only the lines in the area being drawn (a caret blink redraws a few points, not the whole note).
+        let visible = lineIndices(in: dirty)
+        guard !visible.isEmpty else { return }
         // Monospaced blocks: one rounded background per block.
-        var i = 0
-        while i < parsed.count {
+        var i = visible.lowerBound
+        while i < visible.upperBound {
             if parsed[i].kind == .code || (parsed[i].kind == .fence && (i + 1 < parsed.count && parsed[i + 1].kind == .code)) {
                 let block = codeBlock(around: parsed[i].kind == .fence ? min(i + 1, parsed.count - 1) : i)
                 let rects = block.compactMap { j in parsed[j].kind == .code ? lineRect(parsed[j]) : nil }
@@ -678,7 +811,9 @@ final class NoteTextView: NSTextView {
         }
         // Table grids.
         let x0 = textContainerOrigin.x + (textContainer?.lineFragmentPadding ?? 5)
-        for t in tables {
+        let visibleChars = NSRange(location: parsed[visible.lowerBound].range.location,
+                                   length: parsed[visible.upperBound - 1].range.upperBound - parsed[visible.lowerBound].range.location)
+        for t in tables where t.rows.contains(where: { NSIntersectionRange($0.range, visibleChars).length > 0 || NSLocationInRange($0.range.location, visibleChars) }) {
             let rects = t.rows.compactMap(lineRect)
             // A table that ends the note has no spacing after its last row: give it the same room.
             let endsNote = (t.rows.last?.range.upperBound ?? 0) >= (string as NSString).length
@@ -692,7 +827,7 @@ final class NoteTextView: NSTextView {
             let frame = NSBezierPath(roundedRect: NSRect(x: x0, y: top, width: right, height: bottom - top), xRadius: 6, yRadius: 6)
             frame.lineWidth = 1; frame.stroke()
         }
-        for l in parsed {
+        for l in parsed[visible] {
             switch l.kind {
             case .attachment(let name, let label):
                 guard let line = lineRect(l), line.intersects(dirty) else { continue }
@@ -756,13 +891,34 @@ final class NoteTextView: NSTextView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        for l in parsed { if case .check = l.kind, let r = boxRect(l) { addCursorRect(r, cursor: .arrow) } }
+        for l in parsed[lineIndices(in: visibleRect)] { if case .check = l.kind, let r = boxRect(l) { addCursorRect(r, cursor: .arrow) } }
+    }
+
+    /// The parsed lines inside a rectangle of the view (with one line of margin), from the layout already done.
+    private func lineIndices(in rect: NSRect) -> Range<Int> {
+        guard let lm = layoutManager, let tc = textContainer, !parsed.isEmpty else { return 0..<0 }
+        let r = rect.offsetBy(dx: -textContainerOrigin.x, dy: -textContainerOrigin.y)
+        let glyphs = lm.glyphRange(forBoundingRectWithoutAdditionalLayout: r, in: tc)
+        let chars = lm.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+        let first = lineIndex(at: chars.location) ?? 0
+        let last = lineIndex(at: min(chars.upperBound, (string as NSString).length)) ?? (parsed.count - 1)
+        return max(0, first - 1)..<min(parsed.count, max(first, last) + 2)
     }
 
     /// Attachments are as wide as the note: measure again when the width changes.
     private var styledWidth: CGFloat = 0
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        // While the window is being resized the attachments keep their size; they're measured again at the end.
+        if !inLiveResize { remeasureAttachmentsIfNeeded() }
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        remeasureAttachmentsIfNeeded()
+    }
+
+    private func remeasureAttachmentsIfNeeded() {
         if abs(contentWidth - styledWidth) > 0.5, parsed.contains(where: { if case .attachment = $0.kind { return true }; return false }) {
             restyle()
         }
@@ -1196,7 +1352,8 @@ struct NoteFormatMenu: View {
 @MainActor
 enum AttachmentArt {
     static let imageTypes: Set<String> = ["png", "jpg", "jpeg", "heic", "heif", "gif", "webp", "tiff", "bmp"]
-    private static var thumbs: [String: NSImage] = [:]
+    /// Previews of attachments: about 48 MB at most, emptied by macOS under memory pressure.
+    private static let thumbs: NSCache<NSString, NSImage> = { let c = NSCache<NSString, NSImage>(); c.totalCostLimit = 48 << 20; return c }()
 
     static func kind(_ name: String) -> String {
         let ext = (name as NSString).pathExtension
@@ -1205,7 +1362,7 @@ enum AttachmentArt {
 
     /// A downscaled picture (images; a PDF's first page), cached.
     static func thumbnail(_ name: String) -> NSImage? {
-        if let t = thumbs[name] { return t }
+        if let t = thumbs.object(forKey: name as NSString) { return t }
         let url = NoteAttachments.url(name)
         guard NoteAttachments.has(name) else { return nil }
         var image: NSImage?
@@ -1214,7 +1371,7 @@ enum AttachmentArt {
             if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
                let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
                                                                       kCGImageSourceCreateThumbnailWithTransform: true,
-                                                                      kCGImageSourceThumbnailMaxPixelSize: 1600] as CFDictionary) {
+                                                                      kCGImageSourceThumbnailMaxPixelSize: 1200] as CFDictionary) {
                 image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
             }
         case "pdf":
@@ -1232,7 +1389,7 @@ enum AttachmentArt {
             }
         default: break
         }
-        if let image { thumbs[name] = image }
+        if let image { thumbs.setObject(image, forKey: name as NSString, cost: Int(image.size.width * image.size.height * 4)) }
         return image
     }
 

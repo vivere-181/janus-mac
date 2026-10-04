@@ -52,6 +52,12 @@ final class NotificationHistory {
               !(n.title.isEmpty && n.text.isEmpty) else { return n.postedAt }
         let now = Date()
         if let i = entries.firstIndex(where: { $0.deviceID == device.id && $0.key == key }) {
+            // The same notification seen again (a reconnect re-sends what's on the phone): nothing to change or save
+            // unless its 24 hours would otherwise run out noticeably earlier.
+            let e = entries[i]
+            if e.appName == n.appName, e.title == n.title, e.text == n.text, now.timeIntervalSince(e.lastSeen) < 600 {
+                return e.postedAt
+            }
             entries[i].appName = n.appName; entries[i].title = n.title; entries[i].text = n.text
             entries[i].lastSeen = now
             if let icon = copyIcon(n.iconPath) { entries[i].iconFile = icon }
@@ -105,8 +111,11 @@ final class NotificationHistory {
 
     private func prune() {
         let cutoff = Date().addingTimeInterval(-Self.keep)
-        entries.removeAll { $0.lastSeen < cutoff }
+        if entries.contains(where: { $0.lastSeen < cutoff }) { entries.removeAll { $0.lastSeen < cutoff } }
     }
+
+    /// Icons nothing refers to are removed once per launch (not on every save).
+    @ObservationIgnored private var iconsCleaned = false
 
     /// Icons are small; one copy per distinct file, named after its path.
     private func copyIcon(_ path: String?) -> String? {
@@ -122,13 +131,15 @@ final class NotificationHistory {
     private func save() {
         prune()
         saveTask?.cancel()
+        let cleanIcons = !iconsCleaned
+        iconsCleaned = true
         saveTask = Task { [entries] in
             try? await Task.sleep(for: .seconds(1))
             guard !Task.isCancelled else { return }
             let url = Self.file
             await Task.detached(priority: .utility) {
                 if let data = try? JSONEncoder().encode(entries) { try? data.write(to: url, options: .atomic) }
-                // Icons nothing refers to any more.
+                guard cleanIcons else { return }
                 let used = Set(entries.compactMap(\.iconFile))
                 let iconDir = url.deletingLastPathComponent().appendingPathComponent("NotificationIcons")
                 for f in (try? FileManager.default.contentsOfDirectory(atPath: iconDir.path)) ?? []

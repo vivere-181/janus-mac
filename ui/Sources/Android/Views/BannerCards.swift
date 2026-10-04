@@ -253,7 +253,7 @@ struct BannerCard: View {
                 .frame(width: 38, height: 38)
                 .background(tint.gradient, in: Circle())
         case .image(let path):
-            if let image = NSImage(contentsOfFile: path) {
+            if let image = ImageCache.file(path, points: 38) {
                 Image(nsImage: image).resizable().interpolation(.high)
                     .frame(width: 38, height: 38)
                     .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))

@@ -318,7 +318,7 @@ private struct NowPlayingRow: View {
     }
 
     private var scrubber: some View {
-        TimelineView(.periodic(from: .now, by: 0.5)) { ctx in
+        TimelineView(PlaybackTicks(m, running: expanded && scrubbing == nil)) { ctx in
             let pos = scrubbing ?? Double(device.media.currentPosition(at: ctx.date))
             VStack(spacing: 1) {
                 Slider(value: Binding(get: { pos }, set: { scrubbing = $0 }), in: 0...Double(max(m.length, 1))) { editing in
@@ -367,7 +367,7 @@ struct TransferSummary {
 
     var thumbnail: some View {
         Color.clear.frame(width: 22, height: 22)
-            .overlay { PreviewImage(transfer: first) }
+            .overlay { PreviewImage(transfer: first, compact: true) }
             .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 

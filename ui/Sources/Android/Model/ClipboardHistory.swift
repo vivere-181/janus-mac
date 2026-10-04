@@ -7,14 +7,17 @@ import SwiftUI
 final class ClipboardHistory {
     static let shared = ClipboardHistory()
     static let limit = 25
+    /// Copied images are kept as they were copied; only the most recent few, so memory stays small.
+    static let imageLimit = 5
 
     struct Item: Identifiable, Equatable {
         enum Kind { case text, link, image }
         let id = UUID()
         let kind: Kind
         let text: String            // text, link, or a short image description
-        let image: NSImage?
-        let imageData: Data?        // PNG, to copy it back
+        let image: NSImage?         // a small thumbnail (images)
+        let imageData: Data?        // the image as copied, to copy it back
+        var imageType: NSPasteboard.PasteboardType = .png
         var date = Date()
 
         static func == (a: Item, b: Item) -> Bool { a.id == b.id }
@@ -33,16 +36,32 @@ final class ClipboardHistory {
         "com.agilebits.onepassword", "de.petermaurer.TransientPasteboardType", "Pasteboard generator type",
     ]
 
-    func start() {
-        guard timer == nil else { return }
-        // The clipboard has no change notification; comparing a counter once a second costs nothing.
-        let t = Timer(timeInterval: 1, repeats: true) { _ in MainActor.assumeIsolated { self.check() } }
-        t.tolerance = 0.5
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+    @ObservationIgnored private var activationObserver: Any?
+
+    /// The clipboard has no change notification. While history is on: a counter compared every 2 s, and right away
+    /// when another app comes forward or the panel opens (where people copy). Off: nothing runs.
+    func start() { updateRunning() }
+
+    func updateRunning() {
+        if Self.enabled {
+            guard timer == nil else { return }
+            let t = Timer(timeInterval: 2, repeats: true) { _ in MainActor.assumeIsolated { self.check() } }
+            t.tolerance = 1
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+            activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { ClipboardHistory.shared.check() }
+            }
+        } else {
+            timer?.invalidate(); timer = nil
+            if let o = activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(o) }
+            activationObserver = nil
+            lastChange = NSPasteboard.general.changeCount
+        }
     }
 
-    private func check() {
+    func check() {
         let pb = NSPasteboard.general
         guard pb.changeCount != lastChange else { return }
         lastChange = pb.changeCount
@@ -54,19 +73,33 @@ final class ClipboardHistory {
             let isLink = URL(string: text).map { ["http", "https"].contains($0.scheme ?? "") } ?? false
             add(Item(kind: isLink ? .link : .text, text: String(text.prefix(5000)), image: nil, imageData: nil))
         } else if !types.contains(NSPasteboard.PasteboardType.fileURL.rawValue),
-                  let image = NSImage(pasteboard: pb),
-                  let tiff = image.tiffRepresentation, tiff.count < 40_000_000,
-                  let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
-            let size = image.size
-            add(Item(kind: .image, text: "Image · \(Int(size.width))×\(Int(size.height))", image: image, imageData: png))
+                  let type = [NSPasteboard.PasteboardType.png, .tiff].first(where: { types.contains($0.rawValue) }),
+                  let data = pb.data(forType: type), data.count < 40_000_000 {
+            // As copied (no conversion); the thumbnail is made off the main thread.
+            Task.detached(priority: .utility) {
+                guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+                      let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                      let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                                 kCGImageSourceCreateThumbnailWithTransform: true,
+                                                                                 kCGImageSourceThumbnailMaxPixelSize: 96] as CFDictionary)
+                else { return }
+                let w = props[kCGImagePropertyPixelWidth] as? Int ?? thumb.width, h = props[kCGImagePropertyPixelHeight] as? Int ?? thumb.height
+                let image = NSImage(cgImage: thumb, size: NSSize(width: thumb.width, height: thumb.height))
+                await MainActor.run {
+                    ClipboardHistory.shared.add(Item(kind: .image, text: "Image · \(w)×\(h)", image: image, imageData: data, imageType: type))
+                }
+            }
         }
     }
 
-    private func add(_ item: Item) {
+    fileprivate func add(_ item: Item) {
         // Copying the same text again moves it to the top instead of repeating it.
         if item.kind != .image { items.removeAll { $0.kind != .image && $0.text == item.text } }
         items.insert(item, at: 0)
         if items.count > Self.limit { items.removeLast(items.count - Self.limit) }
+        // Only the newest few images are kept.
+        let images = items.indices.filter { items[$0].kind == .image }
+        if images.count > Self.imageLimit { for i in images.dropFirst(Self.imageLimit).reversed() { items.remove(at: i) } }
     }
 
     /// Puts an item back on the clipboard (the engine then sends it to the phone as usual).
@@ -74,7 +107,7 @@ final class ClipboardHistory {
         let pb = NSPasteboard.general
         pb.clearContents()
         if let data = item.imageData {
-            pb.setData(data, forType: .png)
+            pb.setData(data, forType: item.imageType)
         } else {
             pb.setString(item.text, forType: .string)
         }
@@ -89,7 +122,7 @@ final class ClipboardHistory {
     func send(_ item: Item, to device: Device) {
         if let data = item.imageData {
             let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("Android/Outgoing/Clipboard \(item.date.formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false).timeSeparator(.omitted))).png")
+                .appendingPathComponent("Android/Outgoing/Clipboard \(item.date.formatted(.iso8601.year().month().day().time(includingFractionalSeconds: false).timeSeparator(.omitted))).\(item.imageType == .tiff ? "tiff" : "png")")
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             if (try? data.write(to: url)) != nil { device.share([url]) }
         } else {

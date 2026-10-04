@@ -63,6 +63,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
     func install() {
         guard item == nil else { return }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        shownLabel = ""   // a new item shows nothing yet
         item.button?.image = MenuBarLabel.icon
         // (The expanded-interface API is in the macOS 27 SDK: Xcode 27 / Swift 6.4. Older Xcodes build without it.)
         #if compiler(>=6.4)
@@ -102,6 +103,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         PopupHost.shared.refresh()   // the popup steps aside while the panel is open (its cards stay)
         popover.contentViewController?.view.window?.makeKey()
+        AppModel.shared.uiVisibilityChanged()   // latency, live progress: refreshed while it's open
+        if ClipboardHistory.enabled { ClipboardHistory.shared.check() }   // what was just copied shows at once
     }
 
     /// Developer probe: during the next ~0.8 s, record where the SwiftUI content's top edge is relative
@@ -169,6 +172,7 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
     /// Release the panel once closed: a hidden popover keeps its views alive, and their timers and
     /// animations would keep using CPU. It's rebuilt (quickly) on the next open.
     func popoverDidClose(_ notification: Notification) {
+        AppModel.shared.uiVisibilityChanged()
         sizeTimer?.invalidate()
         popover?.contentViewController = nil
         popover = nil
@@ -267,6 +271,9 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
     static var showsLiveLabel: Bool { UserDefaults.standard.object(forKey: "live.menuBar") as? Bool ?? true }
 
     /// "8 min", "12:04" or "62%" next to the icon while something is live on the phone.
+    /// The label currently shown (to skip redrawing an unchanged one).
+    private var shownLabel = ""
+
     func updateLiveLabel() {
         guard let item, let button = item.button else { return }
         let activity = Self.showsLiveLabel ? AppModel.shared.connectedDevices.lazy.compactMap(\.headlineActivity).first : nil
@@ -280,40 +287,44 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
         // The tooltip names whatever the text had to leave out.
         let alsoMeeting = liveText != nil && imminent == nil ? calendar.headline(at: now)?.text : nil
         let alsoLive = imminent != nil ? liveText.map { t in [activity?.title, t].compactMap { $0 }.joined(separator: " ") } : nil
+        // What the item should show; the menu bar is only touched when it changes (a tick usually changes nothing).
+        let label: (text: String, tooltip: String?, green: Bool)?
         if let call {
-            item.length = NSStatusItem.variableLength
-            button.imagePosition = .imageLeading
-            button.attributedTitle = NSAttributedString(string: " " + CallTimer.format(Date().timeIntervalSince(call.start)), attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .medium),
-                .foregroundColor: NSColor.systemGreen])
-            button.toolTip = "On call with \(call.name.isEmpty ? call.number : call.name)"
+            label = (" " + CallTimer.format(Date().timeIntervalSince(call.start)), "On call with \(call.name.isEmpty ? call.number : call.name)", true)
         } else if let meeting, imminent != nil || liveText == nil {
-            item.length = NSStatusItem.variableLength
-            button.imagePosition = .imageLeading
-            button.attributedTitle = NSAttributedString(string: " " + meeting.text, attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .medium)])
-            button.toolTip = (["\(meeting.event.title) · \(meeting.event.timeRange)"] + [alsoLive].compactMap { $0 }).joined(separator: "\n")
+            label = (" " + meeting.text, (["\(meeting.event.title) · \(meeting.event.timeRange)"] + [alsoLive].compactMap { $0 }).joined(separator: "\n"), false)
         } else if let text = liveText {
-            item.length = NSStatusItem.variableLength
-            button.imagePosition = .imageLeading
-            button.attributedTitle = NSAttributedString(string: " " + text, attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .medium)])
-            button.toolTip = ([[activity?.app, activity?.title].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")]
-                              + [alsoMeeting].compactMap { $0 }).joined(separator: "\n")
+            label = (" " + text, ([[activity?.app, activity?.title].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")]
+                                  + [alsoMeeting].compactMap { $0 }).joined(separator: "\n"), false)
         } else {
-            button.title = ""
-            button.imagePosition = .imageOnly
-            button.toolTip = nil
-            item.length = NSStatusItem.squareLength
+            label = nil
         }
-        // A running clock ticks every second; a calendar countdown (minutes) every 15 s; nothing else ticks.
+        let key = label.map { "\($0.green)|\($0.text)|\($0.tooltip ?? "")" } ?? ""
+        if key != shownLabel {
+            shownLabel = key
+            if let label {
+                item.length = NSStatusItem.variableLength
+                button.imagePosition = .imageLeading
+                var attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .medium)]
+                if label.green { attrs[.foregroundColor] = NSColor.systemGreen }
+                button.attributedTitle = NSAttributedString(string: label.text, attributes: attrs)
+                button.toolTip = label.tooltip
+            } else {
+                button.title = ""
+                button.imagePosition = .imageOnly
+                button.toolTip = nil
+                item.length = NSStatusItem.squareLength
+            }
+        }
+        // A running clock ticks every second; a calendar countdown (whole minutes) every 30 s; nothing else ticks.
         let interval: TimeInterval? = call != nil || activity?.needsTicking(at: .now) == true ? 1
-            : calendar.showInMenuBar && calendar.needsTicking(at: .now) ? 15 : nil
+            : calendar.showInMenuBar && calendar.needsTicking(at: .now) ? 30 : nil
         if interval != liveTimer?.timeInterval {
             liveTimer?.invalidate()
             liveTimer = nil
             if let interval {
                 let t = Timer(timeInterval: interval, repeats: true) { _ in MainActor.assumeIsolated { self.updateLiveLabel() } }
+                t.tolerance = interval == 1 ? 0.05 : 5   // lets macOS batch the wake-ups
                 RunLoop.main.add(t, forMode: .common)
                 liveTimer = t
             }

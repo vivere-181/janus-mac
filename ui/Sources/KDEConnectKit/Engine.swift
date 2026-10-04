@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 /// Locates and starts KDE Connect's engine: a private dbus-daemon (address published in a file in this user's
@@ -135,45 +136,57 @@ public enum KDEConnectEngine {
 
     public static func stopEngine() { stopDaemon() }
 
-    /// Process ID of the running engine, if any.
-    public static func daemonPID() -> pid_t? { pidOfDaemon().flatMap { pid_t($0) } }
+    /// Process ID of the running engine, if any. Remembered and re-checked with the kernel (no processes launched):
+    /// this is asked every second while a transfer runs.
+    public static func daemonPID() -> pid_t? {
+        lock.lock(); defer { lock.unlock() }
+        if let p = cachedPID, isDaemon(p) { return p }
+        cachedPID = pids(named: daemonNames).first
+        return cachedPID
+    }
 
-    /// When the running kdeconnectd was started (nil if not running).
+    /// When the running engine was started (nil if not running).
     public static func daemonStartDate() -> Date? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/ps")
-        p.arguments = ["-o", "lstart=", "-p", pidOfDaemon() ?? "0"]
-        p.environment = ["LC_ALL": "C"]   // English month and day names, whatever the Mac's language
-        let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
-        try? p.run(); p.waitUntilExit()
-        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "EEE MMM d HH:mm:ss yyyy"
-        return f.date(from: text.replacingOccurrences(of: "  ", with: " "))
+        guard let pid = daemonPID(), let info = bsdInfo(pid) else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1e6)
     }
 
-    private static func pidOfDaemon() -> String? {
-        for name in daemonNames {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            p.arguments = ["-x", "-U", String(getuid()), name]   // this user's engine only
-            let out = Pipe(); p.standardOutput = out
-            try? p.run(); p.waitUntilExit()
-            if let pid = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                .split(separator: "\n").first.map(String.init) { return pid }
-        }
-        return nil
-    }
+    private static func pidOfDaemon() -> String? { daemonPID().map { String($0) } }
 
     private static func stopDaemon() {
-        for name in daemonNames {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-            p.arguments = ["-x", "-U", String(getuid()), name]
-            try? p.run(); p.waitUntilExit()
-        }
+        lock.lock(); cachedPID = nil; lock.unlock()
+        for pid in pids(named: daemonNames) { kill(pid, SIGTERM) }
+    }
+
+    // MARK: Processes, from the kernel
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cachedPID: pid_t?
+
+    private static func processName(_ pid: pid_t) -> String? {
+        var buf = [CChar](repeating: 0, count: 256)
+        guard proc_name(pid, &buf, UInt32(buf.count)) > 0 else { return nil }
+        return String(cString: buf)
+    }
+
+    private static func bsdInfo(_ pid: pid_t) -> proc_bsdinfo? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size ? info : nil
+    }
+
+    /// One of the engine's names, run by this user (other users' engines aren't ours).
+    private static func isDaemon(_ pid: pid_t) -> Bool {
+        guard let name = processName(pid), daemonNames.contains(name), let info = bsdInfo(pid) else { return false }
+        return info.pbi_uid == getuid()
+    }
+
+    private static func pids(named names: [String]) -> [pid_t] {
+        let count = proc_listallpids(nil, 0)
+        guard count > 0 else { return [] }
+        var all = [pid_t](repeating: 0, count: Int(count) + 32)
+        let got = proc_listallpids(&all, Int32(all.count * MemoryLayout<pid_t>.size))
+        return all.prefix(Int(max(0, got))).filter { $0 > 0 && names.contains(processName($0) ?? "") && (bsdInfo($0)?.pbi_uid == getuid()) }
     }
 }
 

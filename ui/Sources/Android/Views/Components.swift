@@ -152,7 +152,7 @@ struct AlbumArt: View {
 
     var body: some View {
         Group {
-            if let url, let image = NSImage(contentsOf: url) {
+            if let url, let image = ImageCache.file(url.path, points: size) {
                 Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
             } else {
                 ZStack {
@@ -187,7 +187,7 @@ struct Avatar: View {
 
     var body: some View {
         Group {
-            if let photo, let image = NSImage(data: photo) {
+            if let image = ImageCache.data(photo, points: size) {
                 Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
             } else if !initials.isEmpty {
                 Text(initials)
@@ -223,5 +223,29 @@ extension Date {
             return formatted(.dateTime.weekday(.abbreviated))
         }
         return formatted(date: .numeric, time: .omitted)
+    }
+}
+
+/// Redraws a playback time once per second, on the second the position actually changes, and not at all while
+/// paused or hidden (a paused song's time doesn't move).
+struct PlaybackTicks: TimelineSchedule {
+    let start: Date
+    let running: Bool
+
+    init(_ media: MediaState, running: Bool) {
+        self.running = running && media.isPlaying
+        let ms = media.currentPosition()
+        start = Date().addingTimeInterval(Double(1000 - ms % 1000) / 1000)
+    }
+
+    func entries(from startDate: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next: Date? = startDate
+        let first = start, running = running && mode != .lowFrequency
+        return AnyIterator {
+            guard let current = next else { return nil }
+            if !running { next = nil; return current }
+            next = current == startDate ? max(first, startDate.addingTimeInterval(0.001)) : current.addingTimeInterval(1)
+            return current
+        }
     }
 }

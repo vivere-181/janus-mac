@@ -99,7 +99,8 @@ private struct GeneralSettings: View {
                     set: { UserDefaults.standard.set($0, forKey: "popup.receive") }))
                 Toggle("Keep a history of what you copy (Clipboard in the sidebar)", isOn: Binding(
                     get: { ClipboardHistory.enabled },
-                    set: { UserDefaults.standard.set($0, forKey: "clipboard.history"); if !$0 { ClipboardHistory.shared.clear() } }))
+                    set: { UserDefaults.standard.set($0, forKey: "clipboard.history"); if !$0 { ClipboardHistory.shared.clear() }
+                          ClipboardHistory.shared.updateRunning() }))
                 Toggle("Show live activities next to the menu bar icon", isOn: Binding(
                     get: { StatusItemController.showsLiveLabel },
                     set: { UserDefaults.standard.set($0, forKey: "live.menuBar"); StatusItemController.shared.updateLiveLabel() }))

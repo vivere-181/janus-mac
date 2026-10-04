@@ -45,7 +45,10 @@ final class MirrorVideoView: NSView {
         }
     }
 
-    func flush() { displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil) }
+    func flush() {
+        displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+        lastSample = nil   // the last key frame isn't kept after mirroring
+    }
 
     /// Where the video is drawn inside the view (aspect fit).
     private var videoRect: CGRect {

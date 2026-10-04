@@ -20,13 +20,18 @@ final class Inspector {
     private(set) var entries: [Entry] = []
     var selection: UUID?
 
+    /// Recording only matters with the developer tools on (Settings → Developer); otherwise nothing is kept.
+    static var recording: Bool { UserDefaults.standard.bool(forKey: "developer.tools") }
+
     func record(_ kind: String, source: String, title: String, fields: [(String, String)]) {
+        guard Self.recording else { return }
         entries.insert(Entry(kind: kind, source: source, title: title, fields: fields), at: 0)
         if entries.count > 300 { entries.removeLast(entries.count - 300) }
     }
 
     /// A notification's properties as the engine has them (companion messages included; JSON bodies pretty-printed).
     func recordNotification(_ p: [String: DBusValue], id: String, device: Device) {
+        guard Self.recording else { return }   // (building the fields costs more than storing them)
         let internalId = p["internalId"]?.string ?? ""
         let kind: String
         switch true {
