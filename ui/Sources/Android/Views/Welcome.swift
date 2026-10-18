@@ -54,7 +54,7 @@ struct PairingCode: View {
             if let link {
                 QRCode(text: link, size: size)
             } else if unavailable {
-                Label("QR pairing needs Janus's own connection engine.", systemImage: "exclamationmark.triangle")
+                Label("The pairing code couldn't be made. Quit Janus and open it again.", systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.secondary).frame(width: size + 28, height: size + 28)
             } else {
                 ProgressView().frame(width: size + 28, height: size + 28)
