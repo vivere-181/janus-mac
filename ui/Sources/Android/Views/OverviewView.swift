@@ -25,6 +25,17 @@ struct OverviewView: View {
                     }
                     .onTapGesture(count: 2) { model.section = .media }
                 }
+                if !device.isTV { phoneCards }
+            }
+            .padding(24)
+            .frame(maxWidth: 900)
+            .frame(maxWidth: .infinity)
+        }
+        .navigationTitle("Overview")
+    }
+
+    /// Transfers, notifications and messages: a phone's (a TV has none, R38).
+    @ViewBuilder private var phoneCards: some View {
                 RecentTransfersStrip { model.section = .files }
                     .padding(.horizontal, 4)
                 HStack(alignment: .top, spacing: Metrics.gap) {
@@ -57,12 +68,6 @@ struct OverviewView: View {
                         }
                     }
                 }
-            }
-            .padding(24)
-            .frame(maxWidth: 900)
-            .frame(maxWidth: .infinity)
-        }
-        .navigationTitle("Overview")
     }
 
     /// Two equal columns: the phone on the left, what you can do with it on the right. The pills inside
@@ -71,7 +76,10 @@ struct OverviewView: View {
         HStack(alignment: .top, spacing: Metrics.gap) {
             DeviceHeroCard(device: device, dropTargeted: $dropTargeted)
                 .frame(maxWidth: .infinity)
-            if device.isReachable {
+            if device.isTV {
+                ScreenShareCard(device: device)
+                    .frame(maxWidth: .infinity)
+            } else if device.isReachable {
                 ControlCenterCard(device: device)
                     .frame(maxWidth: .infinity)
             }
@@ -119,8 +127,11 @@ struct DeviceHeroCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous))
         }
         .cardBackground(highlight: dropTargeted)
-        .dropDestination(for: URL.self) { urls, _ in device.share(urls.filter(\.isFileURL)); return true } isTargeted: { dropTargeted = $0 }
-        .help("Drop files here to send them to \(device.name)")
+        .dropDestination(for: URL.self) { urls, _ in
+            guard !device.isTV else { return false }   // a TV doesn't take files
+            device.share(urls.filter(\.isFileURL)); return true
+        } isTargeted: { dropTargeted = $0 && !device.isTV }
+        .help(device.isTV ? "" : "Drop files here to send them to \(device.name)")
     }
 
     private func art(_ look: DeviceLook, height: CGFloat) -> some View {
@@ -145,6 +156,7 @@ struct DeviceHeroCard: View {
 
     /// "Galaxy S25 · Navy", "Pixel 9 Pro · Android 16": the real model (and the colour when it's an official one).
     private func subtitle(_ look: DeviceLook) -> String {
+        if device.isTV { return "Android TV" }
         guard device.type == "phone" else { return device.type.capitalized }
         let model = device.modelName ?? "Android phone"
         if look.shape != .front { return "\(model) · \(look.finish.title)" }

@@ -1,10 +1,11 @@
 import AppKit
 import KDEConnectKit
+import NativeEngine
 import Network
 import Observation
 
 enum Pane: String, CaseIterable, Identifiable, Hashable {
-    case overview, calendar, notes, messages, notifications, media, files, clipboard, remote, connection, settings, testing
+    case overview, calendar, notes, messages, notifications, media, files, clipboard, remote, connection, settings
     var id: String { rawValue }
 
     var title: String {
@@ -20,7 +21,6 @@ enum Pane: String, CaseIterable, Identifiable, Hashable {
         case .remote: "Remote Input"
         case .connection: "Connection"
         case .settings: "Settings"
-        case .testing: "Testing"
         }
     }
 
@@ -37,7 +37,6 @@ enum Pane: String, CaseIterable, Identifiable, Hashable {
         case .remote: "cursorarrow.rays"
         case .connection: "antenna.radiowaves.left.and.right"
         case .settings: "gearshape.fill"
-        case .testing: "hammer.fill"
         }
     }
 
@@ -54,7 +53,6 @@ enum Pane: String, CaseIterable, Identifiable, Hashable {
         case .remote: .systemPurple
         case .connection: .systemTeal
         case .settings: .systemGray
-        case .testing: .systemBrown
         }
     }
 }
@@ -75,6 +73,11 @@ final class AppModel {
     var section: Pane? = .overview
     /// Set to ask the always-alive menu bar label to open the main window.
     var wantsMainWindow = false
+    /// Counts each time the main window is asked to show: it builds its content again even when macOS doesn't make
+    /// it key (opened from the background, it isn't activated).
+    var mainWindowOpens = 0
+    /// A note to show in the Notes section (from a widget): selected there, ready to type.
+    var noteToOpen: String?
     /// Presents the "Add Device" sheet in the main window.
     var showAddDevice = false
     /// Presents the New Message sheet (with an optional prefilled "To" query).
@@ -93,7 +96,7 @@ final class AppModel {
     /// Recent connection history (newest first), also written to ~/Library/Logs/Android/connection.log.
     var events: [ConnectionEvent] = []
 
-    @ObservationIgnored private var bus: DBusConnection?
+    @ObservationIgnored private var bus: (any EngineBus)?
     @ObservationIgnored private var reconnecting = false
     @ObservationIgnored var nudgeTask: Task<Void, Never>?
     @ObservationIgnored var pathMonitor: NWPathMonitor?
@@ -150,7 +153,8 @@ final class AppModel {
     }
 
     var selectedDevice: Device? {
-        devices.first { $0.id == selectedDeviceID } ?? pairedDevices.first
+        // Phones first: a TV is only shown when picked (or when it's the only device).
+        devices.first { $0.id == selectedDeviceID } ?? pairedDevices.first { !$0.isTV } ?? pairedDevices.first
     }
     var pairedDevices: [Device] { devices.filter(\.isPaired) }
     var connectedDevices: [Device] { devices.filter { $0.isPaired && $0.isReachable } }
@@ -162,17 +166,15 @@ final class AppModel {
     func connect() async {
         state = .connecting
         do {
-            let bus = try await KDEConnectEngine.connect()
+            // Janus's own engine (R40), inside the app.
+            let bus = try NativeEngine.start(log: { line in Task { @MainActor in debugLog("engine: " + line) } })
             self.bus = bus
             bus.onClose = { [weak self] in Task { @MainActor in self?.connectionLost() } }
             bus.addSignalHandler { [weak self] msg in Task { @MainActor in self?.handle(msg) } }
-            try await bus.addMatch("type='signal',sender='\(KDEConnectEngine.service)'")
-            // Watchdog: learn immediately if the engine exits or restarts.
-            try await bus.addMatch("type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='\(KDEConnectEngine.service)'")
             state = .connected
             log(.info, "Connected to the connection engine")
-            busAddress = KDEConnectEngine.currentAddress() ?? ""
-            engineStartedAt = KDEConnectEngine.daemonStartDate()
+            busAddress = "native"
+            engineStartedAt = .now
             await refreshDevices()
             announcedName = (try? await daemonCall("announcedName").first?.string) ?? ""
             syncMacName()
@@ -187,7 +189,7 @@ final class AppModel {
 
     private func connectionLost() {
         guard state == .connected else { return }
-        log(.warning, "Lost the connection engine's message bus; restarting")
+        log(.warning, "Lost the connection engine; restarting")
         bus = nil
         devices = []
         lastReachable = [:]
@@ -223,7 +225,7 @@ final class AppModel {
             if await waitForPhone(seconds: 20) {
                 reconnectNote = "Reconnected"
             } else {
-                reconnectNote = "Phone not found. Open the companion app on your phone and check it's on the same Wi-Fi."
+                reconnectNote = "Phone not found. Open Janus on your phone and check it's on the same Wi-Fi."
             }
         }
     }
@@ -248,16 +250,25 @@ final class AppModel {
         lastPaired = []
         state = .connecting
         old?.shutdown()
-        KDEConnectEngine.stopEngine()
         try? await Task.sleep(for: .seconds(1))
         reconnecting = false
         await connect()
     }
 
+    /// The device just paired by QR code (R41), for the pairing screens.
+    var pairedByCode: String?
+
+    /// The link for the pairing QR code (a fresh single-use code), nil when the engine can't do QR pairing.
+    func pairingLink() async -> String? {
+        return try? await daemonCall("janusPairingURI").first?.string
+    }
+
+    func endPairingOffer() { Task { _ = try? await daemonCall("janusEndPairingOffer") } }
+
     @discardableResult
     func daemonCall(_ member: String, _ args: [DBusValue] = []) async throws -> [DBusValue] {
         guard let bus else { throw DBusError(name: "Disconnected", message: "Not connected") }
-        return try await bus.call(destination: KDEConnectEngine.service, path: KDEConnectEngine.daemonPath,
+        return try await bus.call(destination: EnginePaths.service, path: EnginePaths.daemonPath,
                                   interface: "org.kde.kdeconnect.daemon", member: member, args)
     }
 
@@ -332,7 +343,8 @@ final class AppModel {
         // The window and menu bar only work with a paired device selected (an unpaired one hides the device
         // switcher), so move on to another paired device whenever the selected one isn't paired any more.
         if selectedDevice?.isPaired != true {
-            selectedDeviceID = (connectedDevices.first ?? pairedDevices.first)?.id ?? (selectedDevice == nil ? nil : selectedDeviceID)
+            selectedDeviceID = (connectedDevices.first { !$0.isTV } ?? pairedDevices.first { !$0.isTV } ?? connectedDevices.first ?? pairedDevices.first)?.id
+                ?? (selectedDevice == nil ? nil : selectedDeviceID)
         }
     }
 
@@ -371,7 +383,7 @@ final class AppModel {
 
     func refreshCustomAddresses() async {
         guard let bus else { return }
-        customAddresses = (try? await bus.getProperty(destination: KDEConnectEngine.service, path: KDEConnectEngine.daemonPath,
+        customAddresses = (try? await bus.getProperty(destination: EnginePaths.service, path: EnginePaths.daemonPath,
                                                       interface: "org.kde.kdeconnect.daemon", name: "customDevices"))?.strings ?? []
     }
 
@@ -379,7 +391,7 @@ final class AppModel {
         guard let bus else { return }
         customAddresses = list
         Task {
-            try? await bus.setProperty(destination: KDEConnectEngine.service, path: KDEConnectEngine.daemonPath,
+            try? await bus.setProperty(destination: EnginePaths.service, path: EnginePaths.daemonPath,
                                        interface: "org.kde.kdeconnect.daemon", name: "customDevices", value: .strings(list))
             refreshNetwork()
             await refreshCustomAddresses()
@@ -443,15 +455,7 @@ final class AppModel {
 
     private func handle(_ msg: DBusMessage) {
         guard let path = msg.path, let member = msg.member else { return }
-        if member == "NameOwnerChanged", msg.body.first?.string == KDEConnectEngine.service {
-            let newOwner = msg.body.count > 2 ? msg.body[2].string ?? "" : ""
-            if newOwner.isEmpty, state == .connected, !reconnecting {
-                log(.warning, "The connection engine stopped unexpectedly; starting it again")
-                Task { await restartEngine() }
-            }
-            return
-        }
-        if path == KDEConnectEngine.daemonPath {
+        if path == EnginePaths.daemonPath {
             switch member {
             case "deviceAdded", "deviceRemoved", "deviceListChanged", "deviceVisibilityChanged", "pairingRequestsChanged":
                 requestRefresh()
@@ -459,11 +463,18 @@ final class AppModel {
                 announcedName = msg.body.first?.string ?? announcedName
             case "linkProvidersChanged":
                 Task { await refreshLinkProviders() }
+            case "janusPairedByCode":
+                // Paired by scanning this Mac's QR code (R41): the owner was at both devices, so it's theirs.
+                if let id = msg.body.first?.string {
+                    UserDefaults.standard.set(DeviceTrust.Level.mine.rawValue, forKey: "trust.\(id)")
+                    pairedByCode = id
+                }
+                requestRefresh()
             default: break
             }
             return
         }
-        let prefix = KDEConnectEngine.daemonPath + "/devices/"
+        let prefix = EnginePaths.daemonPath + "/devices/"
         guard path.hasPrefix(prefix) else { return }
         let rest = path.dropFirst(prefix.count).split(separator: "/", maxSplits: 1).map(String.init)
         guard let device = devices.first(where: { $0.id == rest[0] }) else {
@@ -478,7 +489,7 @@ final class AppModel {
 }
 
 extension AppModel {
-    /// An address on this Mac's own network ("192.168.10.42"), for "e.g." hints.
+    /// An address on this Mac's own network ("192.168.1.42"), for "e.g." hints.
     nonisolated static var exampleAddress: String {
         guard let mine = Latency.localIPv4Addresses().first else { return "192.168.1.42" }
         let parts = mine.split(separator: ".")

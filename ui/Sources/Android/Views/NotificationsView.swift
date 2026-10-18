@@ -10,7 +10,7 @@ struct NotificationsView: View {
                 ContentUnavailableView {
                     Label("No Notifications", systemImage: "bell.slash")
                 } description: {
-                    Text("Notifications from \(device.name) appear here and stay for 24 hours. If nothing shows up, allow notification access for the companion app on the phone.")
+                    Text("Notifications from \(device.name) appear here and stay for 24 hours. If nothing shows up, allow notification access for Janus on the phone.")
                 }
             } else {
                 ScrollView {

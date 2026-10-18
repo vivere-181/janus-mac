@@ -26,7 +26,7 @@ enum IntentFailure: Error, CustomLocalizedStringResourceConvertible {
     case notConnected, missingFeature(String)
     var localizedStringResource: LocalizedStringResource {
         switch self {
-        case .notConnected: "Your phone isn't connected. Open the companion app on the phone and try again."
+        case .notConnected: "Your phone isn't connected. Open Janus on the phone and try again."
         case .missingFeature(let f): "\(f) isn't turned on for this phone."
         }
     }
@@ -198,7 +198,7 @@ struct SetPhoneDNDIntent: AppIntent {
     }
     @MainActor func perform() async throws -> some IntentResult {
         let d = try await connectedPhone(phone)
-        guard d.supports("dnd") else { throw IntentFailure.missingFeature("Do Not Disturb sync (companion app)") }
+        guard d.supports("dnd") else { throw IntentFailure.missingFeature("Do Not Disturb sync (Janus on the phone)") }
         d.setPhoneDND(on, reason: "Shortcut")
         return .result()
     }

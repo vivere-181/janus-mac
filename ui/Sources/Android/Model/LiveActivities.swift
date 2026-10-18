@@ -91,8 +91,8 @@ extension Double {
 }
 
 extension Device {
-    /// Live activities to show: a call already has its own card and row.
-    var visibleLive: [LiveActivity] { activeCall == nil ? live : live.filter { $0.category != "call" } }
+    /// Live activities to show (calls aren't kept: phone calls have their own card and row).
+    var visibleLive: [LiveActivity] { live }
 
     /// The activity shown next to the menu bar icon: navigation and rides first, then the most recent.
     var headlineActivity: LiveActivity? {

@@ -13,3 +13,7 @@ jobs:
         run: |
           cd ui
           swift build -c release --product Android
+      - name: Test the protocol pieces
+        run: |
+          cd ui
+          swift test --filter JanusLinkTests

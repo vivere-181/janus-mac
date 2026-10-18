@@ -23,7 +23,17 @@ struct NotesPane: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Search")
         .toolbar { toolbar }
         .onChange(of: selection) { old, _ in discardIfEmpty(old) }
+        // Closing the window (or leaving Notes) on a new note nothing was written in doesn't keep it either.
+        .onDisappear { discardIfEmpty(selection) }
         .onAppear { if selection == nil { selection = (showingTrash ? store.trash : store.live).first?.id } }
+        // A note asked for from a widget: out of Recently Deleted and search, and selected.
+        .onChange(of: model.noteToOpen, initial: true) { _, id in
+            guard let id else { return }
+            showingTrash = false
+            search = ""
+            selection = id
+            model.noteToOpen = nil
+        }
     }
 
     // MARK: List
@@ -184,10 +194,7 @@ struct NotesPane: View {
     }
 
     /// A new note left without writing anything isn't kept.
-    private func discardIfEmpty(_ id: String?) {
-        guard let n = store.note(id), n.deleted == nil, n.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        store.deleteNow(n.id)
-    }
+    private func discardIfEmpty(_ id: String?) { store.discardIfEmpty(id) }
 
     private var syncStatus: String {
         let peers = store.peers()

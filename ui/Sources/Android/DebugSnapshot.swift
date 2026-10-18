@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import WidgetFeed
 import UserNotifications
 
 /// Developer hook: renders the app's own windows to PNGs in build.noindex/snapshots (next to the built app) so the
@@ -118,6 +119,146 @@ enum DebugSnapshot {
         if name == "mediaplay", let d = model.selectedDevice { d.media.isPlaying = true; d.media.positionDate = .now; return }
         if name == "openpanel" { StatusItemController.shared.showPanel(); return }
         if name == "closepanel" { StatusItemController.shared.closePanel(); return }
+        // widgetfeedtest: a note with every kind of line and inline formatting, as the widgets get it (JSON).
+        if name == "widgetfeedtest" {
+            let text = "Formatting test\nIntro with **bold**, *italic*, ~~gone~~, `code` and a [link](https://example.com).\n\n# Big heading\n## Medium heading\n### Small heading\n- bullet with **bold**\n\t- nested snake_case_name\n1. first\n- [ ] task *soon*\n- [x] done task\n\n> a quote\n\n\n\nLast line after three empty lines\n\n"
+            let note = WidgetFeed.Note(id: "test", rev: "1", title: "Formatting test", pinned: true, modified: .now, lines: NotesWidgets.lines(of: text))
+            if let data = WidgetFeed.encode(.init(notes: [note])) { try? data.write(to: dir.appendingPathComponent("widgetfeedtest.json")) }
+            return
+        }
+        // notewindowshot: the first note window as on screen; notewindowframe:x,y,w,h moves and sizes it.
+        if name == "notewindowshot", let w = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("note:") == true && $0.isVisible }) {
+            debugCapture(w, "notewindow"); return
+        }
+        if name.hasPrefix("notewindowframe:"), let w = NSApp.windows.first(where: { $0.identifier?.rawValue.hasPrefix("note:") == true && $0.isVisible }) {
+            let v = name.dropFirst(16).split(separator: ",").compactMap { Double($0) }
+            if v.count == 4 { w.setFrame(NSRect(x: v[0], y: v[1], width: v[2], height: v[3]), display: true) }
+            return
+        }
+        if name == "notewindowclose" { NSApp.windows.first { $0.identifier?.rawValue.hasPrefix("note:") == true && $0.isVisible }?.performClose(nil); return }
+        // menubaricon:<pt> sets the menu bar icon's height (to compare sizes).
+        if name.hasPrefix("menubaricon:"), let h = Double(name.dropFirst(12)) {
+            StatusItemController.shared.button?.image = MenuBarLabel.icon(height: h); return
+        }
+        // tablecaret: insert a table, type in a cell, Tab, type: where the caret is drawn each time (logged), and a picture.
+        if name == "tablecaret" {
+            let tv = NoteTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 260))
+            let w = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 500, height: 260), styleMask: [.titled], backing: .buffered, defer: false)
+            w.isReleasedWhenClosed = false   // Swift owns it (closing would release it a second time)
+            let scroll = NSScrollView(frame: w.contentView!.bounds); scroll.documentView = tv; w.contentView = scroll
+            w.orderFrontRegardless(); w.makeFirstResponder(tv)
+            tv.string = "Table test"; tv.restyle(); tv.setSelectedRange(NSRange(location: 10, length: 0))
+            func step(_ what: String) { tv.layoutManager?.ensureLayout(for: tv.textContainer!); debugLog("tablecaret \(what): \(tv.debugCaret())") }
+            tv.insertTable(nil); step("new table")
+            tv.insertText("ტესტი", replacementRange: tv.selectedRange()); step("typed Georgian")
+            tv.insertTab(nil); step("Tab")
+            tv.insertText("abc", replacementRange: tv.selectedRange()); step("typed abc")
+            tv.insertTab(nil); step("Tab to next row")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { debugCapture(w, "tablecaret"); w.close() }
+            return
+        }
+        // codeflow: a conversation's notification as the phone sends it (posted, then updated per message): which
+        // codes get announced (no alerts shown).
+        if name == "codeflow", let d = model.selectedDevice {
+            let cc = CodeCenter.shared
+            cc.quiet = true; cc.announced = []
+            var n = PhoneNotification(id: "sim-\(Int.random(in: 1000...9999))")
+            n.appName = "Messages"; n.title = "Shop"; n.postedAt = .now
+            func step(_ what: String, _ text: String, isNew: Bool) {
+                let before = n.codeText
+                n.text = text
+                let had = d.checkForCode(n, isNew: isNew, before: isNew ? nil : before)
+                debugLog("codeflow \(what): has code \(had), announced so far \(cc.announced)")
+            }
+            let a = Int.random(in: 100000...199999), b = a + 111111, c = a + 222222
+            step("1 first SMS", "Your verification code is \(a)", isNew: true)
+            step("2 second SMS (update)", "Your verification code is \(a)\nYour verification code is \(b)", isNew: false)
+            step("3 plain message (update)", "Your verification code is \(a)\nYour verification code is \(b)\nThanks for registering!", isNew: false)
+            step("4 third SMS, latest only (update)", "Your verification code is \(c)", isNew: false)
+            step("5 same text re-sent (update)", "Your verification code is \(c)", isNew: false)
+            var old = PhoneNotification(id: "sim-old-\(a)")
+            old.appName = "Messages"; old.title = "Bank"; old.text = "Your code is \(a + 333333)"; old.postedAt = .now.addingTimeInterval(-1800)
+            debugLog("codeflow 6 old notification re-sent after reconnect: has code \(d.checkForCode(old, isNew: true, before: nil)), announced \(cc.announced)")
+            debugLog("codeflow expected: [\(a), \(b), \(c)]")
+            cc.quiet = false
+            return
+        }
+        // appcall: an app's ongoing-call live activity (as the phone sends WhatsApp's) and a timer: which are kept.
+        if name == "appcall", let d = model.selectedDevice {
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            d.upsertLive(id: "sim.wacall", json: #"{"v":1,"app":"WhatsApp","title":"Ongoing voice call","text":"Nino","when":\#(now - 65_000),"chrono":"up","cat":"call","now":\#(now)}"#, iconPath: nil, via: "test")
+            d.upsertLive(id: "sim.timer2", json: #"{"v":1,"app":"Clock","title":"Tea","text":"Timer","when":\#(now + 180_000),"chrono":"down","cat":"stopwatch","now":\#(now)}"#, iconPath: nil, via: "test")
+            debugLog("appcall: live now \(d.live.map { "\($0.id) [\($0.category ?? "-")]" }), shown \(d.visibleLive.map(\.id))")
+            d.live.removeAll { $0.id == "sim.timer2" || $0.id == "sim.wacall" }
+            return
+        }
+        // Janus Cloud testing: cloudsetup:<url>|<invite>, cloudpeer:<kde id>|<name>|<sign b64>|<box b64> (as if the
+        // phone said hello over the LAN), cloudsend:<kde id>|<file path>, cloudstatus, cloudoff.
+        if name.hasPrefix("cloudsetup:") {
+            let parts = name.dropFirst(11).split(separator: "|", maxSplits: 1).map(String.init)
+            if parts.count == 2, let url = URL(string: parts[0]) {
+                Task { do { try await CloudService.shared.setUp(relay: url, invite: parts[1]); debugLog("cloud: set up, id \(CloudService.shared.deviceID)") } catch { debugLog("cloud: setup failed: \(error.localizedDescription)") } }
+            }
+            return
+        }
+        if name.hasPrefix("cloudpeer:") {
+            let p = name.dropFirst(10).split(separator: "|").map(String.init)
+            if p.count == 4 { Task { do { try await CloudService.shared.testAddPeer(kdeID: p[0], name: p[1], sign: p[2], box: p[3]); debugLog("cloud: peer \(p[1]) added") } catch { debugLog("cloud: peer failed: \(error.localizedDescription)") } } }
+            return
+        }
+        if name.hasPrefix("cloudsend:") {
+            let p = name.dropFirst(10).split(separator: "|", maxSplits: 1).map(String.init)
+            if p.count == 2, let d = model.devices.first(where: { $0.id == p[0] }) {
+                if d.isReachable { CloudTransfers.shared.send([URL(fileURLWithPath: p[1])], to: d) } else { d.share([URL(fileURLWithPath: p[1])]) }
+                debugLog("cloud: sending \(p[1]) to \(d.name) (reachable \(d.isReachable))")
+            }
+            return
+        }
+        if name == "cloudstatus" {
+            let c = CloudService.shared
+            debugLog("cloud: status \(c.status), id \(c.deviceID), peers \(c.peers.map { "\($0.name) \($0.cloudID.prefix(8)) ready \($0.ready)" })")
+            for t in TransferStore.shared.items.prefix(4) where t.viaCloud == true {
+                debugLog("cloud transfer: \(t.direction) \(t.name) \(t.state) \(t.bytesDone)/\(t.size ?? -1) \(t.note ?? "") \(t.url?.path ?? "")")
+            }
+            return
+        }
+        if name == "cloudsettingsshot" {
+            let host = NSHostingController(rootView: Form { CloudSettingsSection() }.formStyle(.grouped).environment(model).frame(width: 620, height: 300))
+            let w = NSWindow(contentViewController: host)
+            w.isReleasedWhenClosed = false
+            w.setContentSize(NSSize(width: 620, height: 300)); w.center(); w.orderFrontRegardless()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { debugCapture(w, "cloudsettings"); w.close() }
+            return
+        }
+        // away:<kde id>: show that phone as not on this network (in the app only, until it next reports in), selected.
+        if name.hasPrefix("away:"), let d = model.devices.first(where: { $0.id == String(name.dropFirst(5)) }) {
+            d.isReachable = false
+            model.selectedDeviceID = d.id
+            return
+        }
+        // ring:<kde id>, sharetext:<kde id>|<text>: Find My Phone and text sharing (through the cloud when away).
+        if name.hasPrefix("ring:"), let d = model.devices.first(where: { $0.id == String(name.dropFirst(5)) }) { d.ring(); return }
+        if name.hasPrefix("sharetext:") {
+            let p = name.dropFirst(10).split(separator: "|", maxSplits: 1).map(String.init)
+            if p.count == 2, let d = model.devices.first(where: { $0.id == p[0] }) { d.shareText(p[1]) }
+            return
+        }
+        if name.hasPrefix("cloudpeerremove:") {
+            let kde = String(name.dropFirst(16))
+            Task { await CloudService.shared.testRemovePeer(kdeID: kde); debugLog("cloud: test peer removed") }
+            return
+        }
+        if name == "devicestate", let d = model.selectedDevice {
+            debugLog("device \(d.name): reachable \(d.isReachable), battery \(d.batteryCharge.map(String.init) ?? "-") charging \(d.isCharging), ringer \(d.status?.ringer ?? "-"), cloud \(CloudService.shared.canReach(d))")
+            return
+        }
+        if name == "panelstate" {
+            let sc = StatusItemController.shared
+            debugLog("panel: shown \(sc.isPanelShown), button window \(sc.button?.window.map { "\($0.frame) visible \($0.isVisible)" } ?? "none"), popup shown \(PopupHost.shared.isShown) cards \(PopupHost.shared.hasCards), locked \(MacState.isLocked)")
+            return
+        }
+        if name == "cloudwake" { NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: NSWorkspace.shared); return }
+        if name == "cloudoff" { Task { await CloudService.shared.turnOff(); debugLog("cloud: off") }; return }
         if name == "windows" {
             let lines = NSApp.windows.map { "\($0.identifier?.rawValue ?? "-") \(type(of: $0)) visible=\($0.isVisible) occluded=\(!$0.occlusionState.contains(.visible)) content=\($0.contentViewController.map { String(describing: type(of: $0)).prefix(60) } ?? "nil") frame=\($0.frame)" }
             try? lines.joined(separator: "\n").write(to: dir.appendingPathComponent("windows.txt"), atomically: true, encoding: .utf8); return
@@ -325,6 +466,7 @@ enum DebugSnapshot {
                     var clear = 0
                     st.enumerateAttribute(.foregroundColor, in: NSRange(location: 0, length: st.length)) { v, r, _ in if (v as? NSColor) == .clear { clear += r.length } }
                     debugLog("render \((name as NSString).lastPathComponent): length \(st.length), clear chars \(clear), used rect \(tv.layoutManager!.usedRect(for: tv.textContainer!))")
+                    tv.debugLayout().forEach { debugLog("  " + $0) }
                 }
                 debugCapture(w, "noterenderfile")
                 if let tv = w.contentView?.firstDescendant(of: NoteTextView.self) {
@@ -698,19 +840,64 @@ enum DebugSnapshot {
             }
             return
         }
-        if name.hasPrefix("sim:"), let i = Int(name.dropFirst(4)), Simulator.Item.allCases.indices.contains(i) { Simulator.run(Simulator.Item.allCases[i]); return }
-        if name == "simclear" { Simulator.clear(); return }
-        if name.hasPrefix("inspectorshot") {
-            let kind = name.split(separator: ":").dropFirst().first.map(String.init)
-            if let kind { Inspector.shared.selection = Inspector.shared.entries.first { $0.kind == kind }?.id }
-            Inspector.shared.show()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                guard let w = NSApp.windows.first(where: { $0.title == "Inspector" }) else { return }
-                typealias Capture = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
-                if let sym = dlsym(dlopen(nil, RTLD_NOW), "CGWindowListCreateImage"),
-                   let image = unsafeBitCast(sym, to: Capture.self)(.null, 8, UInt32(w.windowNumber), 8)?.takeRetainedValue() {
-                    try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("inspector.png"))
+        // TV remote (R39): open it (and capture the window), keys, pairing, state.
+        if name.hasPrefix("tvremote:"), let d = AppModel.shared.devices.first(where: { $0.id == String(name.dropFirst(9)) }) {
+            TVRemoteWindow.shared.show(d)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if let w = TVRemoteWindow.shared.window { debugCapture(w, "tvremote") } }
+            return
+        }
+        if name == "tvremoteshot" { if let w = TVRemoteWindow.shared.window { debugCapture(w, "tvremote") }; return }
+        if name == "tvremoteclose" { TVRemoteWindow.shared.window?.close(); return }
+        if name.hasPrefix("tv"), let d = AppModel.shared.devices.first(where: \.isTV) {
+            let r = TVRemote.of(d)
+            let arg = name.split(separator: ":").dropFirst().joined(separator: ":")
+            switch name.split(separator: ":").first {
+            case "tvkey": if let code = Int64(arg), let k = TVRemote.Key(rawValue: code) { r.press(k) }
+            case "tvopen": r.open(arg)
+            case "tvtype": r.type(arg)
+            case "tvpair": r.startPairing()
+            case "tvcode": r.submitCode(arg)
+            case "tvapps": TVApps.shared.request(d)
+            default: break
+            }
+            debugLog("tv: \(r.status) users \(r.users) main \(NSApp.windows.contains { $0.identifier?.rawValue == "main" && $0.isVisible }) volume \(r.volume.map(String.init) ?? "-")/\(r.volumeMax.map(String.init) ?? "-") muted \(r.muted) power \(r.powerOn.map { "\($0)" } ?? "-") app \(r.appPackage ?? "-") apps \(TVApps.shared.apps(for: d.id).count)")
+            return
+        }
+        // sendfile:<device id>:<path>: send through the app's normal path, then log the transfer every second.
+        if name.hasPrefix("sendfile:") {
+            let parts = name.split(separator: ":", maxSplits: 2).map(String.init)
+            guard parts.count == 3, let d = AppModel.shared.devices.first(where: { $0.id == parts[1] }) else { return }
+            d.share([URL(fileURLWithPath: parts[2])])
+            for i in 1...15 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(i)) {
+                    if let t = TransferStore.shared.items.first(where: { $0.direction == .sent }) {
+                        debugLog("transfer \(t.name): \(t.state) \(t.bytesDone)/\(t.size ?? -1) at \(Int(t.speed / 1024)) KB/s")
+                    }
                 }
+            }
+            return
+        }
+        if name.hasPrefix("welcome") {   // welcome or welcome:<page 0-4>: show it (and capture)
+            WelcomeWindow.shared.window?.close()
+            let page = Int(name.split(separator: ":").dropFirst().first ?? "") ?? 0
+            WelcomeWindow.shared.show(page: WelcomeView.Page(rawValue: page) ?? .hello)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { if let w = WelcomeWindow.shared.window { debugCapture(w, "welcome") } }
+            return
+        }
+        if name == "updatecheck" {
+            Task {
+                await Updater.shared.check(userInitiated: true)
+                debugLog("update: \(Updater.shared.state)")
+                try? await Task.sleep(for: .seconds(1))
+                if let w = NSApp.windows.first(where: { $0.title == "Software Update" }) { debugCapture(w, "update") }
+            }
+            return
+        }
+        if name == "updateinstall", case .available(let r) = Updater.shared.state {
+            Task {
+                await Updater.shared.install(r)
+                debugLog("update: \(Updater.shared.state)")   // only reached when it failed
+                if let w = NSApp.windows.first(where: { $0.title == "Software Update" }) { debugCapture(w, "update") }
             }
             return
         }
@@ -718,7 +905,10 @@ enum DebugSnapshot {
             // The real panel window, as composited on screen (glass included).
             StatusItemController.shared.showPanel()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                guard let w = NSApp.windows.first(where: { String(describing: type(of: $0)).contains("Popover") && $0.isVisible && $0.frame.height > 300 }) else { return }
+                guard let w = NSApp.windows.first(where: { String(describing: type(of: $0)).contains("Popover") && $0.isVisible && $0.frame.height > 120 }) else {
+                    debugLog("panelshot: no panel among \(NSApp.windows.filter(\.isVisible).map { "\(type(of: $0)) \(Int($0.frame.height))" })")
+                    return
+                }
                 if light {
                     w.appearance = NSAppearance(named: .aqua)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { debugCapture(w, "panelshot"); w.appearance = nil; StatusItemController.shared.closePanel() }

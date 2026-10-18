@@ -26,6 +26,19 @@ struct AddDeviceSheet: View {
             if let device = justPaired {
                 success(device)
             } else {
+                do {
+                    // The quickest way (R41): scan with Janus on the phone; it pairs at once.
+                    HStack(alignment: .center, spacing: 20) {
+                        PairingCode(size: 130)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Scan with Janus on your phone").font(.headline)
+                            Text("Open Janus on your phone and scan this code. It pairs at once, as your own device.")
+                                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Divider()
+                    Text("Or pair over Wi-Fi").font(.headline)
+                }
                 steps
                 nearby
                 manual
@@ -53,7 +66,7 @@ struct AddDeviceSheet: View {
     private var steps: some View {
         VStack(alignment: .leading, spacing: 8) {
             step(1, "Connect the phone to the same Wi-Fi as this Mac.")
-            step(2, "Open the companion app on the phone.")
+            step(2, "Open Janus on the phone.")
             step(3, "Choose “\(model.announcedName.isEmpty ? "this Mac" : model.announcedName)” on the phone, or pick the phone below.")
         }
     }
@@ -76,7 +89,7 @@ struct AddDeviceSheet: View {
             }
             let candidates = model.devices.filter { !$0.isPaired && ($0.isReachable || $0.isPairRequestedByPeer) }
             if candidates.isEmpty {
-                Text("Searching… Devices appear here as soon as the companion app is open on the same network.")
+                Text("Searching… Devices appear here as soon as Janus is open on it on the same network.")
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(12)
@@ -167,7 +180,7 @@ struct RenameDeviceSheet: View {
             TextField("Name", text: $text)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(save)
-            Text("This name is used on this Mac only. The phone calls itself “\(device.announcedName)”; to change that, rename it in the companion app on the phone.")
+            Text("This name is used on this Mac only. The phone calls itself “\(device.announcedName)”; to change that, rename it in Janus on the phone.")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {

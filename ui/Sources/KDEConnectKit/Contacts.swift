@@ -7,11 +7,11 @@ public struct PhoneContact: Sendable, Identifiable {
     public let photo: Data?
 }
 
-/// Reads the vCards KDE Connect's contacts plugin syncs from the phone.
+/// Reads the vCards the engine's contacts plugin syncs from the phone.
 public enum ContactBook {
     public static func directory(forDevice id: String) -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("kpeoplevcard/kdeconnect-\(id)", isDirectory: true)
+            .appendingPathComponent("Android/Contacts/\(id)", isDirectory: true)
     }
 
     public static func load(deviceID: String) -> [PhoneContact] {

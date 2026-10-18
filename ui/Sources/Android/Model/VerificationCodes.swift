@@ -18,23 +18,25 @@ enum CodeDetector {
         "認証", "確認コード", "ワンタイム", "인증", "인증번호",
     ]
 
-    /// Latin keywords count only as whole words ("pin" isn't "shopping", "code" isn't "barcode").
-    private static func mentions(_ keyword: String, in lower: String) -> Int? {
+    /// Every place the keyword appears (a conversation's notification can hold several messages). Latin keywords
+    /// count only as whole words ("pin" isn't "shopping", "code" isn't "barcode").
+    private static func mentions(_ keyword: String, in lower: String) -> [Int] {
+        var found: [Int] = []
         var search = lower.startIndex..<lower.endIndex
+        let latin = keyword.unicodeScalars.allSatisfy { $0.isASCII }
         while let r = lower.range(of: keyword, range: search) {
-            let latin = keyword.unicodeScalars.allSatisfy { $0.isASCII }
             let beforeOK = r.lowerBound == lower.startIndex || !lower[lower.index(before: r.lowerBound)].isLetter
             let afterOK = r.upperBound == lower.endIndex || !lower[r.upperBound].isLetter
-            if !latin || (beforeOK && afterOK) { return NSRange(r, in: lower).location }
+            if !latin || (beforeOK && afterOK) { found.append(NSRange(r, in: lower).location) }
             search = r.upperBound..<lower.endIndex
         }
-        return nil
+        return found
     }
 
     static func code(in raw: String) -> String? {
         let text = raw.replacingOccurrences(of: "\u{00A0}", with: " ")
         let lower = text.lowercased()
-        let keywordPositions = keywords.compactMap { mentions($0, in: lower) }
+        let keywordPositions = keywords.flatMap { mentions($0, in: lower) }
         guard !keywordPositions.isEmpty else { return nil }
 
         // Candidates: 4–8 digits, or two 3-digit groups ("123 456", "123-456"), or G-123456 style.
@@ -45,12 +47,13 @@ enum CodeDetector {
             let range = m.range(at: 1)
             let candidate = ns.substring(with: range).replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "-", with: "")
             if isLikelyNotACode(candidate, in: ns, at: m.range) { continue }
-            // Prefer the candidate closest to (ideally right after) a keyword.
+            // Prefer the candidate closest to (ideally right after) a keyword; on a tie the later one, the newest
+            // message (a conversation's notification lists its messages oldest first: "code 111111 … code 222222").
             let distance = keywordPositions.map { k in
                 let d = range.location - k
                 return d >= 0 ? d : -d * 3
             }.min() ?? Int.max
-            if best == nil || distance < best!.distance { best = (candidate, distance) }
+            if best == nil || distance <= best!.distance { best = (candidate, distance) }
         }
         return best?.code
     }
@@ -73,6 +76,10 @@ enum CodeDetector {
         let wordBefore = before.split(whereSeparator: { !$0.isLetter }).last.map(String.init) ?? ""
         let wordAfter = after.split(whereSeparator: { !$0.isLetter }).first.map(String.init) ?? ""
         if [wordBefore, wordAfter].contains(where: { Self.currencyWords.contains($0) }) { return true }
+        // Part of a longer run of digit groups ("+1 555 123 4567", "4111 1111 1111 1111"): a phone or card number.
+        let groupBefore = before.range(of: #"\d[ -]?$"#, options: .regularExpression) != nil
+        let groupAfter = after.range(of: #"^[ -]?\d"#, options: .regularExpression) != nil
+        if groupBefore || groupAfter { return true }
         // Long runs are more likely phone or account numbers.
         return digits.count > 8
     }
@@ -85,6 +92,9 @@ final class CodeCenter {
     static let shared = CodeCenter()
     private(set) var latest: (code: String, from: String, date: Date)?
     private var recent: [String: Date] = [:]
+    /// Testing aid: codes announced, and whether to skip the alerts and clipboard.
+    var announced: [String] = []
+    var quiet = false
 
     static var autoCopy: Bool { UserDefaults.standard.bool(forKey: "codes.autoCopy") }
     static var enabled: Bool { UserDefaults.standard.object(forKey: "codes.enabled") as? Bool ?? true }
@@ -98,6 +108,8 @@ final class CodeCenter {
         guard recent[code] == nil else { return false }
         recent[code] = now
         latest = (code, sender, now)
+        announced.append(code)
+        if quiet { return true }
         if Self.autoCopy { copy(code, autoClear: true) }
         Notifier.shared.verificationCode(code, from: sender, device: device, copied: Self.autoCopy)
         AppModel.shared.log(.info, "Verification code received from \(sender)")

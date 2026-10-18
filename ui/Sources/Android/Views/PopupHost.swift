@@ -47,6 +47,14 @@ final class PopupHost: NSObject, NSPopoverDelegate {
         if !p.isShown { p.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY) }
     }
 
+    /// The menu bar panel is opening: out of its way at once, without animation (the cards are kept).
+    func stepAside() {
+        guard let p = popover, p.isShown else { return }
+        p.animates = false
+        p.close()
+        popoverDidClose(Notification(name: NSPopover.didCloseNotification))
+    }
+
     /// Release the popover once closed: a hidden one keeps its views (and their timers) alive.
     func popoverDidClose(_ notification: Notification) {
         popover?.contentViewController = nil

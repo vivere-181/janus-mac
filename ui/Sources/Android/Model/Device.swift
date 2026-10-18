@@ -1,3 +1,4 @@
+import JanusLink
 import AppKit
 import KDEConnectKit
 import Observation
@@ -74,12 +75,21 @@ struct PhoneNotification: Identifiable, Equatable {
     /// What the phone is (R28): maker, model, screen shape, region (JSON).
     static let profilePrefix = "ge.connect.device"
     var isProfile: Bool { internalId.hasPrefix(Self.profilePrefix) }
+    /// A TV's apps (R39, CONTRACT → ge.connect.tvapps): {"apps":[{package,label,banner}]}, re-sent when they change.
+    static let tvAppsPrefix = "ge.connect.tvapps:"
+    var isTVApps: Bool { internalId.hasPrefix(Self.tvAppsPrefix) }
     /// Notes sync (R29): hello / push / ack (JSON).
     static let notesPrefix = "ge.connect.notes:"
     var isNotes: Bool { internalId.hasPrefix(Self.notesPrefix) }
+    /// Janus Cloud keys, exchanged over the LAN (R36, shared/CLOUD.md §3): hello / forget (JSON).
+    static let cloudPrefix = "ge.connect.cloud:"
+    var isCloud: Bool { internalId.hasPrefix(Self.cloudPrefix) }
     /// Every `ge.connect.` notification is a companion message: never shown or listed, and unknown
     /// kinds are ignored (see shared/CONTRACT.md).
     var isControl: Bool { internalId.hasPrefix("ge.connect.") }
+
+    /// The text a one-time code is looked for in.
+    var codeText: String { NotificationText.plain([title, text].joined(separator: " ")) }
 }
 
 struct ReceivedItem: Identifiable, Equatable {
@@ -91,8 +101,8 @@ struct ReceivedItem: Identifiable, Equatable {
 @MainActor @Observable
 final class Device: Identifiable {
     let id: String
-    @ObservationIgnored let bus: DBusConnection
-    var path: String { KDEConnectEngine.daemonPath + "/devices/" + id }
+    @ObservationIgnored let bus: any EngineBus
+    var path: String { EnginePaths.daemonPath + "/devices/" + id }
 
     // Identity & pairing
     /// What the app shows: the user's nickname if set, otherwise the name the phone announces.
@@ -164,7 +174,12 @@ final class Device: Identifiable {
     /// report status (i.e. run our app).
     func command(_ body: String) {
         guard runsCompanion else {
-            AppModel.shared.log(.warning, "\(name) doesn't run the companion app; didn't send \(body.prefix { $0 != ":" })")
+            AppModel.shared.log(.warning, "\(name) doesn't run Janus for Android; didn't send \(body.prefix { $0 != ":" })")
+            return
+        }
+        // Away from this network: the ones that make sense remotely go through Janus Cloud (shared/CLOUD.md §13).
+        if !isReachable, CloudService.goesThroughCloud(body), CloudService.shared.canReach(self) {
+            CloudService.shared.sendCompanion(body, to: self)
             return
         }
         ping("ge.connect." + body)
@@ -206,6 +221,9 @@ final class Device: Identifiable {
             guard kv.count == 2 else { continue }
             switch kv[0] {
             case "ringer": s.ringer = kv[1]
+            // Through Janus Cloud the status carries the battery (on the LAN it comes from the battery plugin).
+            case "battery": if let c = Int(kv[1]), (0...100).contains(c) { batteryCharge = c }
+            case "charging": isCharging = kv[1] == "1"
             case "flashlight": s.flashlight = kv[1] == "on"
             case "dnd": phoneDND = kv[1] == "on"
             case "wifi": s.ssid = kv[1].isEmpty ? nil : kv[1]
@@ -247,7 +265,7 @@ final class Device: Identifiable {
     var contactsByNumber: [String: [(number: String, contact: PhoneContact)]] = [:]
     var contacts: [PhoneContact] = []
 
-    init(id: String, bus: DBusConnection) {
+    init(id: String, bus: any EngineBus) {
         self.id = id
         self.bus = bus
         profile = DeviceProfiles.get(id)
@@ -276,6 +294,15 @@ final class Device: Identifiable {
 
     func has(_ plugin: String) -> Bool { loadedPlugins.contains("kdeconnect_" + plugin) }
 
+    /// An Android TV running Janus (R38): it only gets TV things here (media control, remote input, screen sharing),
+    /// no files, clipboard, notes, Find, notifications or calendar.
+    var isTV: Bool { type == "tv" }
+
+    /// Whether this device has that section in the main window.
+    func shows(_ pane: Pane) -> Bool {
+        !isTV || [.overview, .media, .remote, .connection, .settings].contains(pane)
+    }
+
     var statusText: String {
         if isPairRequestedByPeer { return "Wants to pair" }
         if isPairRequested { return "Waiting for phone…" }
@@ -288,9 +315,9 @@ final class Device: Identifiable {
     var symbol: String {
         switch type {
         case "tablet": "ipad"
+        case "tv": "tv"
         case "desktop": "desktopcomputer"
         case "laptop": "laptopcomputer"
-        case "tv": "tv"
         default: "smartphone"
         }
     }
@@ -299,7 +326,7 @@ final class Device: Identifiable {
 
     @discardableResult
     func call(_ sub: String?, _ iface: String, _ member: String, _ args: [DBusValue] = []) async throws -> [DBusValue] {
-        try await bus.call(destination: KDEConnectEngine.service, path: sub.map { path + "/" + $0 } ?? path,
+        try await bus.call(destination: EnginePaths.service, path: sub.map { path + "/" + $0 } ?? path,
                            interface: "org.kde.kdeconnect.device" + (iface.isEmpty ? "" : "." + iface),
                            member: member, args)
     }
@@ -312,7 +339,7 @@ final class Device: Identifiable {
     }
 
     func props(_ sub: String?, _ iface: String) async -> [String: DBusValue] {
-        (try? await bus.getAllProperties(destination: KDEConnectEngine.service, path: sub.map { path + "/" + $0 } ?? path,
+        (try? await bus.getAllProperties(destination: EnginePaths.service, path: sub.map { path + "/" + $0 } ?? path,
                                          interface: "org.kde.kdeconnect.device" + (iface.isEmpty ? "" : "." + iface))) ?? [:]
     }
 
@@ -451,60 +478,21 @@ final class Device: Identifiable {
             if let nid = body.first?.string {
                 debugLiveLog("signal \(member) \(nid)")
                 let isNew = member == "notificationPosted" && !notifications.contains { $0.id == nid }
+                let before = notifications.first { $0.id == nid }.map(\.codeText)
                 Task {
                     await loadNotification(nid)
                     guard let n = notifications.first(where: { $0.id == nid }) else { return }
                     if n.isControl {
                         // Companion messages from our phone app (see shared/CONTRACT.md).
                         notifications.removeAll { $0.id == nid }
-                        if n.isMirrorInfo {
-                            if isNew { MirrorController.shared.phoneMessage(n.text, from: self) }
-                            return
-                        }
-                        if n.isCallState {
-                            applyCallState(id: nid, json: n.text)
-                            return
-                        }
-                        if n.isLive {
-                            upsertLive(id: nid, json: n.text, iconPath: n.iconPath, via: member)
-                            return
-                        }
-                        if n.isCalendar {
-                            if DeviceTrust.isMine(self) { CalendarStore.shared.apply(json: n.text, from: self) }
-                            return
-                        }
-                        if n.isProfile {
-                            DeviceProfiles.apply(json: n.text, from: self)
-                            return
-                        }
-                        guard isNew else { return }
-                        if n.isNotes {
-                            NotesStore.shared.receive(n.text, from: self)
-                        } else if n.isPing {
-                            Notifier.shared.ping(from: self, message: n.text)
-                        } else if n.isDND {
-                            phoneReportedDND(n.text.lowercased().contains("on"))
-                        } else if n.isStatusInfo {
-                            applyStatus(n.text)
-                        } else if n.isCallResult {
-                            CallPopup.shared.result(n.text, device: self)
-                        } else if n.isScreenshotInfo {
-                            TransferStore.shared.expectScreenshot(named: n.text, from: self)
-                        } else if n.isRingInfo {
-                            setRinging(n.text.lowercased().contains("on"), confirmed: true)
-                        } else if n.isTransferInfo {
-                            let parts = n.text.split(separator: "|")
-                            if let total = parts.first.flatMap({ Int64($0.trimmingCharacters(in: .whitespaces)) }) {
-                                let count = parts.dropFirst().first.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 1
-                                TransferStore.shared.expectIncoming(totalBytes: total, files: count, device: self)
-                            }
-                        }
+                        companion(n, isNew: isNew, via: member)
                     } else if isNew {
                         AppModel.shared.log(.info, "Notification from \(n.appName.isEmpty ? "an app" : n.appName) on \(name)")
-                        let sender = n.title.isEmpty ? n.appName : n.title
-                        let hadCode = CodeCenter.shared.inspect(NotificationText.plain([n.title, n.text].joined(separator: " ")), from: sender, device: self)
+                        let hadCode = checkForCode(n, isNew: true, before: nil)
                         // A code notification replaces the plain mirror of the same message.
                         if !hadCode, !n.silent { Notifier.shared.phoneNotification(n, device: self) }
+                    } else {
+                        checkForCode(n, isNew: false, before: before)   // changed in place
                     }
                 }
             }
@@ -551,8 +539,7 @@ final class Device: Identifiable {
     /// the clipboard feature itself: phone copies still arrive and "Send Clipboard" works.
     func setClipboardAutoSync(_ on: Bool) {
         clipboardAutoShareDisabled = !on
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Preferences/kdeconnect/\(id)/kdeconnect_clipboard", isDirectory: true)
+        let dir = LocalIdentity.folder.appendingPathComponent("\(id)/kdeconnect_clipboard", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? "[General]\nautoShare=\(on)\n".write(to: dir.appendingPathComponent("config"), atomically: true, encoding: .utf8)
         AppModel.shared.log(.info, "Automatic clipboard sync with \(name) \(on ? "on" : "off")")
@@ -582,7 +569,11 @@ final class Device: Identifiable {
     func ping(_ message: String? = nil) {
         perform("ping", "ping", "sendPing", message.map { [.string($0)] } ?? [])
     }
-    func ring() { perform("findmyphone", "findmyphone", "ring") }
+    func ring() {
+        guard !isTV else { return }
+        if !isReachable, CloudService.shared.canReach(self) { CloudService.shared.sendCompanion("findmyphone", to: self); return }
+        perform("findmyphone", "findmyphone", "ring")
+    }
 
     /// Find Phone as a toggle: a second request while ringing asks our phone app to stop (it also
     /// reports ringing on/off with a `ge.connect.ring:` marker). Falls back to "off" after 60 s.
@@ -610,13 +601,24 @@ final class Device: Identifiable {
     }
 
     func share(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty, !isTV else { return }
+        // Not on the same network: through Janus Cloud, if this phone is set up for it (or always, for testing).
+        if !isReachable || UserDefaults.standard.bool(forKey: "cloud.force"), CloudService.shared.peer(forDevice: id) != nil {
+            CloudTransfers.shared.send(urls, to: self)
+            return
+        }
         TransferStore.shared.beginSend(urls, device: self)
         perform("share", "share", "shareUrls", [.strings(urls.map(\.absoluteString))])
     }
     func shareText(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
+        guard !t.isEmpty, !isTV else { return }
+        if !isReachable, CloudService.shared.canReach(self) {
+            let isLink = URL(string: t).flatMap(\.scheme).map { ["http", "https"].contains($0) } ?? false
+            TransferStore.shared.sentText(t, isLink: isLink, device: self)
+            CloudService.shared.sendText(t, isLink: isLink, to: self)
+            return
+        }
         if let url = URL(string: t), let scheme = url.scheme, ["http", "https"].contains(scheme) {
             TransferStore.shared.sentText(t, isLink: true, device: self)
             perform("share", "share", "shareUrl", [.string(t)])
@@ -679,7 +681,7 @@ final class Device: Identifiable {
     }
 
     private func setMediaProperty(_ name: String, _ value: DBusValue) async throws {
-        try await bus.setProperty(destination: KDEConnectEngine.service, path: path + "/mprisremote",
+        try await bus.setProperty(destination: EnginePaths.service, path: path + "/mprisremote",
                                   interface: "org.kde.kdeconnect.device.mprisremote", name: name, value: value)
     }
 
@@ -730,7 +732,7 @@ final class Device: Identifiable {
         livePoll = Task { [weak self] in
             while let self, !self.live.isEmpty, AppModel.uiVisible, !Task.isCancelled {
                 for id in self.live.map(\.id) where self.liveEnding[id] == nil {
-                    let p = (try? await self.bus.getAllProperties(destination: KDEConnectEngine.service,
+                    let p = (try? await self.bus.getAllProperties(destination: EnginePaths.service,
                                                                    path: self.path + "/notifications/" + id,
                                                                    interface: "org.kde.kdeconnect.device.notifications.notification")) ?? [:]
                     guard let text = p["text"]?.string else { continue }   // gone: the removal signal handles it
@@ -750,6 +752,13 @@ final class Device: Identifiable {
         debugLiveLog("\(via) \(id) \(json)")
         // A packet read again at startup ("refresh") is older than its "now": no clock correction for it.
         guard var a = LiveActivity(id: id, json: json, iconPath: iconPath, fresh: via != "refresh") else { return }
+        // Calls are phone calls only: those have the call card, with a clock that ends with the call. An app's call
+        // (WhatsApp, Telegram…) isn't one: its clock never learned the call had ended, and its buttons can't work here.
+        if a.category == "call" {
+            live.removeAll { $0.id == id }
+            liveJSON[id] = nil
+            return
+        }
         liveJSON[id] = json
         defer { watchLive() }
         // The phone sends each app's icon once per connection; later packets only refer to it.
@@ -804,10 +813,9 @@ final class Device: Identifiable {
     }
 
     private func loadNotification(_ nid: String) async {
-        let p = (try? await bus.getAllProperties(destination: KDEConnectEngine.service, path: path + "/notifications/" + nid,
+        let p = (try? await bus.getAllProperties(destination: EnginePaths.service, path: path + "/notifications/" + nid,
                                                   interface: "org.kde.kdeconnect.device.notifications.notification")) ?? [:]
         guard !p.isEmpty else { return }
-        Inspector.shared.recordNotification(p, id: nid, device: self)
         var n = notifications.first { $0.id == nid } ?? PhoneNotification(id: nid)
         n.internalId = p["internalId"]?.string ?? ""
         n.appName = p["appName"]?.string ?? ""
@@ -828,11 +836,84 @@ final class Device: Identifiable {
         }
     }
 
+    /// A companion message from our phone app (see shared/CONTRACT.md): over the LAN as a silent notification, or
+    /// through Janus Cloud (`c` envelope, shared/CLOUD.md §13). `isNew`: not a re-send of one already handled.
+    func companion(_ n: PhoneNotification, isNew: Bool, via member: String) {
+        if n.isMirrorInfo {
+            if isNew { MirrorController.shared.phoneMessage(n.text, from: self) }
+            return
+        }
+        if n.isCallState {
+            applyCallState(id: n.id, json: n.text)
+            return
+        }
+        if n.isLive {
+            upsertLive(id: n.id, json: n.text, iconPath: n.iconPath, via: member)
+            return
+        }
+        if n.isCalendar {
+            if DeviceTrust.isMine(self) { CalendarStore.shared.apply(json: n.text, from: self) }
+            return
+        }
+        if n.isProfile {
+            DeviceProfiles.apply(json: n.text, from: self)
+            return
+        }
+        if n.isTVApps {
+            if isNew { TVApps.shared.receive(n.text, from: self) }
+            return
+        }
+        guard isNew else { return }
+        if n.isNotes {
+            NotesStore.shared.receive(n.text, from: self)
+        } else if n.isCloud {
+            CloudService.shared.receiveLAN(n.text, from: self)
+        } else if n.isPing {
+            Notifier.shared.ping(from: self, message: n.text)
+        } else if n.isDND {
+            phoneReportedDND(n.text.lowercased().contains("on"))
+        } else if n.isStatusInfo {
+            applyStatus(n.text)
+        } else if n.isCallResult {
+            CallPopup.shared.result(n.text, device: self)
+        } else if n.isScreenshotInfo {
+            TransferStore.shared.expectScreenshot(named: n.text, from: self)
+        } else if n.isRingInfo {
+            setRinging(n.text.lowercased().contains("on"), confirmed: true)
+        } else if n.isTransferInfo {
+            let parts = n.text.split(separator: "|")
+            if let total = parts.first.flatMap({ Int64($0.trimmingCharacters(in: .whitespaces)) }) {
+                let count = parts.dropFirst().first.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 1
+                TransferStore.shared.expectIncoming(totalBytes: total, files: count, device: self)
+            }
+        }
+    }
+
+    /// Looks for a one-time code in a notification. Returns whether it has one (it's shown as a code then, not mirrored).
+    /// Also when a notification changes in place: messaging apps keep one notification per conversation and update it
+    /// for each new message, so the second and later codes from the same sender only ever arrive as updates. A
+    /// notification re-sent after a reconnect (posted more than 10 minutes ago) isn't announced again.
+    @discardableResult
+    func checkForCode(_ n: PhoneNotification, isNew: Bool, before: String?) -> Bool {
+        let text = n.codeText
+        guard isNew || text != before, let code = CodeDetector.code(in: text) else { return false }
+        // Each notification's codes are announced once: a conversation that gets another (plain) message later
+        // still shows the old code, which isn't new.
+        if codesShown[n.id, default: []].contains(code) { return true }
+        if codesShown.count > 100 { codesShown = [:] }
+        codesShown[n.id, default: []].insert(code)
+        if isNew, Date().timeIntervalSince(n.postedAt) >= 600 { return true }
+        CodeCenter.shared.inspect(text, from: n.title.isEmpty ? n.appName : n.title, device: self)
+        return true
+    }
+    /// Codes already announced, per phone notification.
+    @ObservationIgnored private var codesShown: [String: Set<String>] = [:]
+
     func dismiss(_ n: PhoneNotification) {
         notifications.removeAll { $0.id == n.id }
         NotificationHistory.shared.remove(n, device: self)   // dismissed here: gone, not "earlier"
         Task {
-            _ = try? await bus.call(destination: KDEConnectEngine.service, path: path + "/notifications/" + n.id,
+            _ = try? await bus.call(destination: EnginePaths.service, path: path + "/notifications/" + n.id,
                                     interface: "org.kde.kdeconnect.device.notifications.notification", member: "dismiss")
         }
     }
@@ -870,7 +951,7 @@ final class Device: Identifiable {
 
     func moveCursor(dx: Int, dy: Int) {
         guard dx != 0 || dy != 0 else { return }
-        bus.send(destination: KDEConnectEngine.service, path: path + "/remotecontrol",
+        bus.send(destination: EnginePaths.service, path: path + "/remotecontrol",
                  interface: "org.kde.kdeconnect.device.remotecontrol", member: "moveCursor",
                  [.structure([.int32(Int32(dx)), .int32(Int32(dy))])])
     }
@@ -879,12 +960,12 @@ final class Device: Identifiable {
     /// middleclick, singlehold, singlerelease, scroll (+dx/dy).
     func pointerCommand(_ fields: [String: DBusValue]) {
         let dict = DBusValue.dict(key: "s", value: "v", fields.map { (.string($0.key), .variant($0.value)) })
-        bus.send(destination: KDEConnectEngine.service, path: path + "/remotecontrol",
+        bus.send(destination: EnginePaths.service, path: path + "/remotecontrol",
                  interface: "org.kde.kdeconnect.device.remotecontrol", member: "sendCommand", [dict])
     }
 
     func sendKey(_ key: String, special: Int = 0, shift: Bool = false, ctrl: Bool = false, alt: Bool = false) {
-        bus.send(destination: KDEConnectEngine.service, path: path + "/remotekeyboard",
+        bus.send(destination: EnginePaths.service, path: path + "/remotekeyboard",
                  interface: "org.kde.kdeconnect.device.remotekeyboard", member: "sendKeyPress",
                  [.string(key), .int32(Int32(special)), .bool(shift), .bool(ctrl), .bool(alt), .bool(false)])
     }

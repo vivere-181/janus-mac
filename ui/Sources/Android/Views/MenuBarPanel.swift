@@ -6,19 +6,22 @@ struct MenuBarLabel: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
 
-    static let icon: NSImage = {
+    /// 13 pt tall: the height of the system's own menu bar symbols (Spotlight, Control Center), so it sits among them.
+    static let icon = icon(height: 13)
+
+    static func icon(height: CGFloat) -> NSImage {
         let bundled = Bundle.main.url(forResource: "MenuBarIcon", withExtension: "svg")
         if let url = bundled, let img = NSImage(contentsOf: url) {
-            // The Janus arch, 16 pt tall, at its own proportions.
+            // The Janus arch at its own proportions.
             let aspect = img.size.height > 0 ? img.size.width / img.size.height : 1
-            img.size = NSSize(width: (16 * aspect).rounded(), height: 16)
+            img.size = NSSize(width: (height * aspect).rounded(), height: height)
             img.isTemplate = true
             return img
         }
         let img = NSImage(systemSymbolName: "smartphone", accessibilityDescription: "Janus")!
         img.isTemplate = true
         return img
-    }()
+    }
 
     var body: some View {
         Image(nsImage: Self.icon)
@@ -26,6 +29,7 @@ struct MenuBarLabel: View {
             .onChange(of: model.wantsMainWindow, initial: true) { _, wants in
                 guard wants else { return }
                 model.wantsMainWindow = false
+                model.mainWindowOpens += 1
                 openWindow(id: "main")
                 NSApp.activate()
             }
@@ -45,17 +49,54 @@ struct MenuBarPanel: View {
                 // One spacing value around and between the header and the buttons.
                 VStack(spacing: Self.inset) {
                     PanelHeader(device: device)
-                    if device.isReachable { PanelControls(device: device) }
+                    if device.isReachable, !device.isTV { PanelControls(device: device) }
                 }
                 .padding(Self.inset)
                 .background(headerDrop ? Color.janus.opacity(0.15) : .clear)
-                .dropDestination(for: URL.self) { urls, _ in device.share(urls.filter(\.isFileURL)); return true } isTargeted: { headerDrop = $0 }
-                if device.isReachable {
+                .dropDestination(for: URL.self) { urls, _ in
+                    guard !device.isTV else { return false }   // a TV doesn't take files
+                    device.share(urls.filter(\.isFileURL)); return true
+                } isTargeted: { headerDrop = $0 && !device.isTV }
+                if device.isTV {
+                    // The TV's remote, right here (R39); it talks to the TV directly.
+                    TVRemoteView(device: device, layout: .panel)
+                        .padding(.horizontal, Self.inset).padding(.bottom, Self.inset)
+                    if device.isReachable, device.media.hasTrack {
+                        PanelSection(title: "Now Playing") { NowPlayingRow(device: device) { open(.media) } }
+                    }
+                    Divider().padding(.horizontal, 12)
+                    VStack(spacing: 0) {
+                        MenuRow(symbol: "rectangle.on.rectangle", title: "Screen Mirroring…") {
+                            closePanel(); AirPlayMirroring.openDisplaySettings()
+                        }
+                        MenuRow(symbol: "av.remote", title: "Full Remote") {
+                            closePanel(); TVRemoteWindow.shared.show(device)
+                        }
+                    }
+                    .padding(.horizontal, 5).padding(.vertical, 4)
+                } else if device.isReachable {
                     sections(device)
                 } else {
                     VStack(spacing: 8) {
-                        Text("Your phone isn't connected right now.").font(.callout).foregroundStyle(.secondary)
-                        ReconnectButton(prominent: true)
+                        if CloudService.shared.peer(forDevice: device.id) != nil {
+                            // Not on this network, but reachable through the owner's relay: files still go.
+                            Label("Not on this network · files go through Janus Cloud", systemImage: "icloud")
+                                .font(.callout).foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                Button { closePanel(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { FilePicker.chooseAndSend(to: device) } } label: {
+                                    Label("Send Files…", systemImage: "paperplane")
+                                }
+                                .buttonStyle(.borderedProminent)
+                                if device.supports("cloud2") {
+                                    // Find My Phone works from anywhere (shared/CLOUD.md §13).
+                                    Button { device.ring() } label: { Label("Ring", systemImage: "speaker.wave.2") }
+                                        .help("Ring \(device.name) through Janus Cloud")
+                                }
+                            }
+                        } else {
+                            Text("Your phone isn't connected right now.").font(.callout).foregroundStyle(.secondary)
+                        }
+                        ReconnectButton(prominent: CloudService.shared.peer(forDevice: device.id) == nil)
                         if let note = model.reconnectNote, !model.isReconnecting {
                             Text(note).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }
@@ -113,14 +154,13 @@ struct MenuBarPanel: View {
             }
         }
         CalendarPanelSection()
-        NotesPanelSection { closePanel() }
         if device.media.hasTrack {
             PanelSection(title: "Now Playing") {
                 NowPlayingRow(device: device) { open(.media) }
             }
         }
         let transfers = Array(TransferStore.shared.items.prefix(7))
-        if !transfers.isEmpty {
+        if !transfers.isEmpty, !device.isTV {
             PanelSection(title: "Recent Transfers",
                          detail: transfers[0].date.formatted(.relative(presentation: .named, unitsStyle: .abbreviated)),
                          action: ("See All", { open(.files) })) {
@@ -129,7 +169,7 @@ struct MenuBarPanel: View {
             }
         }
         let clips = Array(ClipboardHistory.shared.items.prefix(3))
-        if !clips.isEmpty {
+        if !clips.isEmpty, !device.isTV {
             PanelSection(title: "Clipboard", action: ("See All", { open(.clipboard) })) {
                 VStack(spacing: 2) {
                     ForEach(clips) { item in
@@ -145,7 +185,7 @@ struct MenuBarPanel: View {
                 .padding(.bottom, 4)
             }
         }
-        if device.unreadCount > 0 || !device.notifications.isEmpty {
+        if !device.isTV, device.unreadCount > 0 || !device.notifications.isEmpty {
             PanelSection(title: "Phone") {
                 if device.unreadCount > 0 {
                     let n = device.unreadCount
@@ -535,7 +575,7 @@ struct EmptyPanelState: View {
             case .connected:
                 Image(systemName: "iphone.gen3.slash").font(.system(size: 34)).foregroundStyle(.secondary)
                 Text(model.pairedDevices.isEmpty ? "No paired phone" : "Phone not connected").font(.headline)
-                Text("Open the companion app on your phone and make sure both devices are on the same Wi-Fi.")
+                Text("Open Janus on your phone and make sure both devices are on the same Wi-Fi.")
                     .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 HStack {
                     Button("Add Device…") { model.showAddDevice = true; model.wantsMainWindow = true }
@@ -663,7 +703,9 @@ private struct PanelHeader: View {
             }
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { textHeight = $0 }
             Spacer(minLength: 8)
-            if device.isReachable, let ringer = device.status?.ringer {
+            if device.isTV {
+                TVPowerButton(device: device)
+            } else if device.isReachable, let ringer = device.status?.ringer {
                 RingerSwitch(device: device, mode: ringer)
             }
         }
@@ -684,6 +726,16 @@ private struct PanelHeader: View {
                 } else {
                     Text("Connected")
                 }
+            } else if CloudService.shared.canReach(device) {
+                // Away, but linked through Janus Cloud: its battery comes with the status the phone sends there.
+                Image(systemName: "icloud.fill").foregroundStyle(Color.janus)
+                Text("via Cloud")
+                if device.supports("cloud2"), let c = device.batteryCharge {
+                    Text("·")
+                    Image(systemName: BatteryView(charge: c, charging: device.isCharging).symbol)
+                        .foregroundStyle(device.isCharging ? .green : .secondary)
+                    Text("\(c)%").monospacedDigit()
+                }
             } else {
                 Text(device.statusText)
             }
@@ -700,6 +752,34 @@ private struct PanelControls: View {
     @Environment(\.closePanel) private var closePanel
 
     var body: some View {
+        if device.isTV { tvControls } else { phoneControls }
+    }
+
+    /// A TV (R38): its own controls only: the remote (pointer and keyboard) and what's playing.
+    private var tvControls: some View {
+        HStack(alignment: .top, spacing: 0) {
+            PanelControlButton(symbol: "rectangle.on.rectangle", title: "Mirror") {
+                closePanel()
+                AirPlayMirroring.openDisplaySettings()
+            }
+            .help("Mirror or extend this Mac to the TV with AirPlay (Displays → +)")
+            PanelControlButton(symbol: "av.remote", title: "Remote") {
+                closePanel()
+                TVRemoteWindow.shared.show(device)
+            }
+            .help("Open the remote for \(device.name)")
+            if device.has("mprisremote") {
+                PanelControlButton(symbol: "play.rectangle", title: "Playing") { open(.media) }
+            }
+        }
+    }
+
+    private func open(_ pane: Pane) {
+        closePanel()
+        SceneActions.showMainWindow(pane)
+    }
+
+    private var phoneControls: some View {
         HStack(alignment: .top, spacing: 0) {
             if device.has("findmyphone") {
                 PanelControlButton(symbol: device.isRinging ? "speaker.slash.fill" : "speaker.wave.2.fill",
@@ -817,36 +897,21 @@ private struct PanelControlButton: View {
     }
 }
 
-/// The two notes most likely wanted (pinned, then recent) and New Note; each opens as a quick note.
-private struct NotesPanelSection: View {
-    let closePanel: () -> Void
+/// A TV's Power in the panel header (where a phone has its ringer).
+private struct TVPowerButton: View {
+    let device: Device
 
     var body: some View {
-        let notes = Array(NotesStore.shared.live.prefix(2))
-        PanelSection(title: "Notes", action: ("New Note", { closePanel(); QuickNote.show(new: true) })) {
-            if notes.isEmpty {
-                MenuRow(symbol: "square.and.pencil", title: "Write a note") { closePanel(); QuickNote.show(new: true) }
-            }
-            ForEach(notes) { n in
-                Button { closePanel(); QuickNote.show(noteID: n.id) } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: n.pinned ? "pin.fill" : "note.text")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(n.pinned ? Color.orange : Color.yellow)
-                            .frame(width: 18)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(n.title).lineLimit(1)
-                            if !n.preview.isEmpty {
-                                Text(n.preview).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                            }
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.horizontal, 9).padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
+        let remote = TVRemote.of(device)
+        Button { remote.press(.power) } label: {
+            Image(systemName: "power")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundStyle(remote.isConnected ? Color.red : Color.secondary)
+                .frame(width: 30, height: 30)
+                .glassEffect(.regular.interactive(), in: Circle())
         }
+        .buttonStyle(.plain)
+        .disabled(!remote.isConnected)
+        .help(remote.powerOn == false ? "Turn the TV on" : "Turn the TV off")
     }
 }

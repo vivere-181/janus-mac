@@ -11,7 +11,8 @@ enum SceneActions {
 
     static func showMainWindow(_ section: Pane? = nil) {
         if let section { AppModel.shared.section = section }
-        openWindow?(id: "main")
+        // Just launched (by a widget's link, say): the scene's actions aren't captured yet; the model opens it.
+        if let openWindow { AppModel.shared.mainWindowOpens += 1; openWindow(id: "main") } else { AppModel.shared.wantsMainWindow = true }
         NSApp.activate()
     }
 
@@ -96,6 +97,14 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
 
     func showPanel() {
         guard let button else { return }
+        // A card on screen (reminder, call, file) is a popover on the same button: AppKit won't open a second one
+        // there, and closing it in the same moment reads as a click outside, which closes the panel again. So the
+        // card steps aside first (its cards stay, and come back when the panel closes), and the panel opens a beat later.
+        if PopupHost.shared.isShown {
+            PopupHost.shared.stepAside()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in self?.showPanel() }
+            return
+        }
         let popover = self.popover ?? makePopover()
         self.popover = popover
         NSApp.activate()

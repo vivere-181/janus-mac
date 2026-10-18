@@ -140,7 +140,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         c.userInfo = ["code": code]
         c.sound = Sounds.notification
         c.interruptionLevel = .timeSensitive
-        post(id: "otp.\(code)", c)
+        // One per sender: a newer code replaces the older one, so the one in Notification Center is the one to use.
+        post(id: "otp.\(device.id).\(sender)", c)
     }
 
     func ping(from device: Device, message: String) {
@@ -166,8 +167,6 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// removes itself after a minute.
     func call(event: String, number: String, contactName: String, device: Device) {
         let ringing = event == "callReceived" || event == "ringing"
-        Inspector.shared.record("Call", source: device.name, title: "\(event) \(contactName.isEmpty ? number : contactName)",
-                                fields: [("event", event), ("number", number), ("contact name", contactName)])
         guard Self.isOn(.calls), ringing || event == "missedCall" else { return }
         let ringingID = "call.\(device.id).\(number).ringing"
         let c = UNMutableNotificationContent()
@@ -246,6 +245,21 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         if !url.isFileURL { c.sound = Sounds.notification }   // files chime when they're all in (TransferStore)
         c.userInfo = ["url": url.absoluteString]
         post(id: "file.\(UUID().uuidString)", c)
+    }
+
+    /// Text shared from the phone (through Janus Cloud): copied, and shown with Copy again.
+    func receivedText(_ text: String, device: Device) {
+        guard Self.isOn(.files) else { return }
+        if BannerCenter.shared.show(Banner(
+            id: "text.\(UUID().uuidString)", thread: "text.\(device.id)", icon: .symbol("text.quote", .blue),
+            appName: device.name, title: "Text received · copied", body: String(text.prefix(300)), lifetime: 15, sound: Sounds.alert,
+            actions: [BannerAction(title: "Copy", primary: true) {
+                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) }])) { return }
+        let c = UNMutableNotificationContent()
+        c.title = "Text from \(device.name) · copied"
+        c.body = String(text.prefix(300))
+        c.sound = Sounds.notification
+        post(id: "text.\(UUID().uuidString)", c)
     }
 
     func batteryLow(_ charge: Int, device: Device) {

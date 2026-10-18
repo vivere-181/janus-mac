@@ -24,7 +24,7 @@ struct RemoteInputView: View {
                             Slider(value: $sensitivity, in: 0.5...4).frame(width: 120)
                         }
                         .controlSize(.small)
-                        Text("Move the pointer to control the phone's cursor. Click to tap, two-finger scroll to scroll, right-click for a long press. Requires remote input to be allowed in the companion app on your phone.")
+                        Text("Move the pointer to control the phone's cursor. Click to tap, two-finger scroll to scroll, right-click for a long press. Requires remote input to be allowed in Janus on your phone.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -34,7 +34,7 @@ struct RemoteInputView: View {
                             Circle().fill(device.remoteKeyboardActive ? .green : .orange).frame(width: 8, height: 8)
                             Text(device.remoteKeyboardActive
                                  ? "The remote keyboard is active on the phone."
-                                 : "Switch the phone's keyboard to the companion app's remote keyboard to type from your Mac.")
+                                 : "Switch the phone's keyboard to Janus's remote keyboard to type from your Mac.")
                                 .font(.callout).foregroundStyle(.secondary)
                         }
                         HStack {

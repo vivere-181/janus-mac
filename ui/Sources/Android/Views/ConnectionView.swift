@@ -98,7 +98,7 @@ struct ConnectionView: View {
                 Text(device.isReachable ? "Connected to \(device.name)" : "\(device.name) is not connected")
                     .font(.title2.weight(.semibold))
                 Text(model.isReconnecting ? (model.reconnectNote ?? "Reconnecting…")
-                     : (model.reconnectNote ?? (device.isReachable ? device.statusText : "Click Reconnect, or open the companion app on the phone.")))
+                     : (model.reconnectNote ?? (device.isReachable ? device.statusText : "Click Reconnect, or open Janus on the phone.")))
                     .foregroundStyle(.secondary)
             }
             Spacer()

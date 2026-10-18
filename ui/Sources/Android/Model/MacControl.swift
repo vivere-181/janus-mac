@@ -132,7 +132,8 @@ enum AudioOutput {
 // MARK: Mac state reported to the phone
 
 /// Tells our phone app what the Mac is doing, so its Control card can show it:
-/// `ge.connect.macstate:muted=on|off|na;finding=on|off;locked=on|off` (see shared/CONTRACT.md).
+/// `ge.connect.macstate:muted=on|off|na;finding=on|off;locked=on|off;…;battery=<0-100>;charging=on|off`
+/// (see shared/CONTRACT.md).
 @MainActor
 enum MacState {
     private(set) static var isLocked = false
@@ -150,6 +151,7 @@ enum MacState {
         }
         AudioOutput.observe { changed() }
         MacIdentity.load()
+        MacBattery.observe { changed() }
     }
 
     static var text: String {
@@ -158,6 +160,8 @@ enum MacState {
         // What this Mac is (R28), so the phone picks its icon and picture without guessing from the name.
         t += ";model=\(MacIdentity.model);kind=\(MacIdentity.isLaptop ? "laptop" : "desktop")"
         if let market = MacIdentity.market { t += ";market=\(market)" }
+        // The battery as macOS reads it: the engine's own report can be wrong (it showed 50% on a full Mac).
+        if let b = MacBattery.current { t += ";battery=\(b.level);charging=\(b.charging ? "on" : "off")" }
         return t
     }
 
@@ -370,5 +374,36 @@ struct MacPopupView: View {
             .padding(14)
             .frame(width: 300)
         }
+    }
+}
+
+/// The Mac's built-in battery, from macOS's power sources (nil on a Mac without one).
+@MainActor
+enum MacBattery {
+    struct Reading: Equatable { let level: Int; let charging: Bool }
+
+    static var current: Reading? {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
+        for source in list {
+            guard let d = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any],
+                  d[kIOPSTypeKey] as? String == kIOPSInternalBatteryType,
+                  let now = d[kIOPSCurrentCapacityKey] as? Int, let max = d[kIOPSMaxCapacityKey] as? Int, max > 0 else { continue }
+            return Reading(level: min(100, Swift.max(0, now * 100 / max)), charging: d[kIOPSIsChargingKey] as? Bool ?? false)
+        }
+        return nil
+    }
+
+    private static var source: CFRunLoopSource?
+    private static var onChange: (() -> Void)?
+
+    /// Calls `change` when the level or charging changes (macOS posts these as power source changes).
+    static func observe(_ change: @escaping () -> Void) {
+        guard source == nil else { return }
+        onChange = change
+        source = IOPSNotificationCreateRunLoopSource({ _ in
+            MainActor.assumeIsolated { MacBattery.onChange?() }
+        }, nil)?.takeRetainedValue()
+        if let source { CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode) }
     }
 }

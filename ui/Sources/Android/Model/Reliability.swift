@@ -89,11 +89,6 @@ extension AppModel {
     private func watchdogTick(previous: Double) async -> Double {
         switch state {
         case .connected:
-            if !KDEConnectEngine.isDaemonRunning {
-                log(.warning, "The connection engine isn't running; starting it")
-                await restartEngine()
-                return 30
-            }
             guard !pairedDevices.isEmpty, connectedDevices.count < pairedDevices.count else { missingChecks = 0; return 300 }
             refreshNetwork()
             missingChecks += 1

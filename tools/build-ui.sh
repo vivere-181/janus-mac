@@ -5,10 +5,14 @@ set -e
 M=${0:A:h:h}
 # The app's identity. Forks: set JANUS_BUNDLE_ID to your own reverse-DNS id (e.g. io.github.<you>.janus).
 BUNDLE_ID=${JANUS_BUNDLE_ID:-io.github.vivere-181.janus}
+# The version people see (ui/VERSION, e.g. 1.2.0) and a build number that always grows (for in-app updates).
+VERSION=$(tr -d '[:space:]' < "$M/ui/VERSION")
+BUILD=$(date -u +%Y%m%d%H%M)
 cd "$M/ui"
 XC_DEV=$(ls -d /Applications/Xcode*.app 2>/dev/null | head -1)
 [[ -n "$XC_DEV" ]] && export DEVELOPER_DIR="$XC_DEV/Contents/Developer"   # SwiftUI's macros need full Xcode
 swift build -c release --product Android > "$M/build.noindex/build.log" 2>&1 || { grep -E "error:" "$M/build.noindex/build.log" | sort -u; echo "build failed"; exit 1; }
+swift build -c release --product JanusWidgets >> "$M/build.noindex/build.log" 2>&1 || { grep -E "error:" "$M/build.noindex/build.log" | sort -u; echo "widgets build failed"; exit 1; }
 BIN=$(swift build -c release --product Android --show-bin-path)/Android
 [[ -x "$BIN" ]] || { echo "build failed"; exit 1; }
 
@@ -41,13 +45,8 @@ fi
 cp "$M/assets/menubar-janus.svg" "$APP/Contents/Resources/MenuBarIcon.svg"
 # Phone mirroring: the scrcpy server (v4.1, Apache-2.0, SHA-256 deacb991…0cae), pushed to the phone per session.
 cp "$M/assets/scrcpy/scrcpy-server-v4.1" "$APP/Contents/Resources/scrcpy-server"
-# adb (Android platform tools, universal), so mirroring works on Macs without the Android SDK. Taken from this Mac's
-# platform tools when present; without it the app looks for adb on the Mac at runtime.
-ADB_SRC=$(for c in "${ANDROID_HOME:-}/platform-tools/adb" "/opt/homebrew/bin/adb" "/usr/local/bin/adb" "$HOME/Library/Android/sdk/platform-tools/adb"; do [[ -x "$c" ]] && { echo "$c"; break; }; done)
-if [[ -n "$ADB_SRC" ]]; then
-  mkdir -p "$APP/Contents/Helpers"
-  cp "$(readlink -f "$ADB_SRC")" "$APP/Contents/Helpers/adb"
-fi
+# Mirroring uses an adb installed on the Mac (e.g. Homebrew's android-platform-tools); Google's prebuilt adb can't be
+# redistributed, so it isn't bundled.
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -60,15 +59,17 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconName</key><string>Janus</string>
   <key>NSAccentColorName</key><string>AccentColor</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSBluetoothAlwaysUsageDescription</key><string>Janus can connect to your phone over Bluetooth when Wi-Fi is not available.</string>
-  <key>NSLocalNetworkUsageDescription</key><string>Janus finds and connects to your phone on your local Wi-Fi network.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Janus finds and connects to your phone and TV on your local Wi-Fi network.</string>
   <key>NSBonjourServices</key>
-  <array><string>_adb-tls-pairing._tcp</string><string>_adb-tls-connect._tcp</string></array>
+  <array><string>_adb-tls-pairing._tcp</string><string>_adb-tls-connect._tcp</string><string>_kdeconnect._udp</string><string>_androidtvremote2._tcp</string></array>
+  <key>NSMicrophoneUsageDescription</key><string>Janus listens while you hold the TV remote's microphone button.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Janus turns what you say into a request for your TV's assistant.</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict><key>CFBundleURLName</key><string>Janus actions</string>
@@ -117,8 +118,8 @@ cat > "$EX/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>AndroidShare</string>
   <key>CFBundlePackageType</key><string>XPC!</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSExtension</key><dict>
     <key>NSExtensionPointIdentifier</key><string>com.apple.share-services</string>
@@ -137,5 +138,41 @@ cat > "$EX/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 codesign --force --sign - --entitlements "$M/ui/ShareExtension/AndroidShare.entitlements" "$EX" 2>/dev/null
+# Notes widgets (WidgetKit extension; sources in Sources/JanusWidgets, built by SwiftPM above). Sandboxed: it reads
+# the notes snapshot the app writes and drops ticked items in its Inbox (WidgetExtension/*.entitlements).
+WX="$APP/Contents/PlugIns/JanusWidgets.appex"
+mkdir -p "$WX/Contents/MacOS" "$WX/Contents/Resources"
+cp "$(dirname "$BIN")/JanusWidgets" "$WX/Contents/MacOS/JanusWidgets"
+WB="$M/build.noindex/widget-intents"; rm -rf "$WB"; mkdir -p "$WB"
+find "$M/ui/.build" -path '*Release*' -path '*JanusWidgets-p.build*' -name '*.swiftconstvalues' > "$WB/constvals.list"
+find "$M/ui/Sources/JanusWidgets" -name '*.swift' > "$WB/sources.list"
+xcrun appintentsmetadataprocessor --output "$WX/Contents/Resources" \
+  --toolchain-dir "$(dirname "$(dirname "$(dirname "$(xcrun --find swiftc)")")")" \
+  --module-name JanusWidgets --sdk-root "$(xcrun --sdk macosx --show-sdk-path)" \
+  --xcode-version "$(xcodebuild -version | awk '/Build version/{print $3}')" \
+  --platform-family macOS --deployment-target 26.0 --target-triple arm64-apple-macos26.0 \
+  --source-file-list "$WB/sources.list" --swift-const-vals-list "$WB/constvals.list" > "$WB/log.txt" 2>&1 \
+  || { tail -5 "$WB/log.txt"; echo "widget App Intents metadata failed"; exit 1; }
+cat > "$WX/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>$BUNDLE_ID.widgets</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+  <key>CFBundleName</key><string>Janus</string>
+  <key>CFBundleDisplayName</key><string>Janus</string>
+  <key>CFBundleExecutable</key><string>JanusWidgets</string>
+  <key>CFBundlePackageType</key><string>XPC!</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>NSExtension</key><dict>
+    <key>NSExtensionPointIdentifier</key><string>com.apple.widgetkit-extension</string>
+  </dict>
+</dict></plist>
+PLIST
+codesign --force --sign - --entitlements "$M/ui/WidgetExtension/JanusWidgets.entitlements" "$WX" 2>/dev/null
 codesign --force --sign - "$APP" 2>/dev/null
 echo "built $APP"

@@ -14,16 +14,24 @@ struct MainWindow: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
             if (note.object as? NSWindow)?.identifier?.rawValue == "main" {
                 open = false
-                DispatchQueue.main.async { NSApp.setActivationPolicy(.accessory) }
+                DispatchQueue.main.async { DockPresence.update() }   // stays in the Dock while a note window is open
             }
         }
-        // Back before it's drawn: becoming key happens while the window is ordered in.
+        // Shown again: by the app (whether or not macOS lets it become key) …
+        .onChange(of: model.mainWindowOpens) { if !open { open = true } }
+        // … or by the system: becoming key happens while the window is ordered in, before it's drawn.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             if !open, (note.object as? NSWindow)?.identifier?.rawValue == "main" { open = true }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
             if !open, let w = note.object as? NSWindow, w.identifier?.rawValue == "main", w.isVisible { open = true }
         }
+    }
+
+    /// The section shown: one this device has (a TV has no Notes or Calendar, R38), else its Overview.
+    private var section: Pane? {
+        guard let d = model.selectedDevice, !d.shows(model.section ?? .overview) else { return model.section }
+        return .overview
     }
 
     private var panes: some View {
@@ -38,26 +46,30 @@ struct MainWindow: View {
             Group {
                 if !open {
                     Color.clear
-                } else if model.section == .settings {
+                } else if section == .settings {
                     SettingsPane()
-                } else if model.section == .testing {
-                    TestingPane()
-                } else if let device = model.selectedDevice, device.isPaired, model.section == .connection {
+                } else if let device = model.selectedDevice, device.isPaired, section == .connection {
                     ConnectionView(device: device)
-                } else if model.section == .notes, model.selectedDevice?.isPaired == true {
+                } else if section == .notes, model.selectedDevice?.isPaired == true {
                     // Notes live on this Mac; they sync when the phone is back.
                     NotesPane()
-                } else if let device = model.selectedDevice, device.isPaired, model.section == .calendar {
+                } else if let device = model.selectedDevice, device.isPaired, section == .calendar {
                     // Works from the cached copy while the phone is away.
                     CalendarPane()
-                } else if let device = model.selectedDevice, device.isPaired, model.section == .notifications, !device.isReachable {
+                } else if let device = model.selectedDevice, device.isPaired, section == .notifications, !device.isReachable {
                     // The last 24 hours, while the phone is away.
                     NotificationsView(device: device)
+                } else if let device = model.selectedDevice, device.isPaired, !device.isReachable, section == .files,
+                          CloudService.shared.peer(forDevice: device.id) != nil {
+                    // Away from this network but linked through Janus Cloud: files still go (and arrive).
+                    TransfersView(device: device)
+                } else if let device = model.selectedDevice, device.isPaired, device.isTV, section == .remote {
+                    // The TV's remote talks to the TV directly: it works while Janus there is asleep.
+                    TVRemoteView(device: device, layout: .wide)
                 } else if let device = model.selectedDevice, device.isPaired, device.isReachable {
-                    switch model.section ?? .overview {
+                    switch section ?? .overview {
                     case .connection: ConnectionView(device: device)
                     case .settings: SettingsPane()
-                    case .testing: TestingPane()
                     case .overview: OverviewView(device: device)
                     case .calendar: CalendarPane()
                     case .notes: NotesPane()
@@ -77,12 +89,15 @@ struct MainWindow: View {
         .overlay(alignment: .top) { PairingBanner() }
         .tint(.janus)   // Janus navy for selections, buttons and controls (R32)
         .sheet(isPresented: $model.showAddDevice) { AddDeviceSheet().environment(model) }
+        // Switching to a TV from a section it doesn't have: its Overview.
+        .onChange(of: model.selectedDeviceID, initial: true) {
+            if let d = model.selectedDevice, !d.shows(model.section ?? .overview) { model.section = .overview }
+        }
     }
 }
 
 struct Sidebar: View {
     @Environment(AppModel.self) private var model
-    @AppStorage("developer.tools") private var developerTools = false
     @State private var renaming: Device?
     @State private var removing: Device?
 
@@ -96,22 +111,19 @@ struct Sidebar: View {
                     deviceMenu(device)
                         .padding(.bottom, 8)
                     // Connection lives in the status box at the bottom of the sidebar.
-                    ForEach(Array(Pane.allCases.filter { ![.connection, .settings, .testing].contains($0) }.enumerated()), id: \.element) { index, pane in
+                    // A TV gets only its own sections (R38).
+                    ForEach(Array(Pane.allCases.filter { ![.connection, .settings].contains($0) && device.shows($0) }.enumerated()), id: \.element) { index, pane in
                         SidebarRow(pane: pane,
                                    selected: (model.section ?? .overview) == pane,
                                    badge: badge(for: pane, device: device),
-                                   dimmed: !device.isReachable && ![.connection, .calendar, .notes, .notifications].contains(pane)) {
+                                   title: device.isTV && pane == .remote ? "Remote" : nil,
+                                   symbol: device.isTV && pane == .remote ? "av.remote" : nil,
+                                   dimmed: !device.isReachable && ![.connection, .calendar, .notes, .notifications].contains(pane)
+                                       && !(device.isTV && pane == .remote)
+                                       && !(pane == .files && CloudService.shared.peer(forDevice: device.id) != nil)) {
                             model.section = pane
                         }
                         .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
-                    }
-                }
-                // Testing tools, for development only (Settings → Developer).
-                if developerTools {
-                    Text("Developer").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                        .padding(.horizontal, 8).padding(.top, 14).padding(.bottom, 2)
-                    SidebarRow(pane: .testing, selected: model.section == .testing, badge: 0, dimmed: false) {
-                        model.section = .testing
                     }
                 }
             }
@@ -159,7 +171,7 @@ struct Sidebar: View {
             Button("Add Device…") { model.showAddDevice = true }
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: "smartphone").font(.body).foregroundStyle(.secondary).frame(width: 22)
+                Image(systemName: device.symbol).font(.body).foregroundStyle(.secondary).frame(width: 22)
                 Text(device.name).font(.headline).lineLimit(1)
                 Spacer(minLength: 4)
                 Image(systemName: "chevron.up.chevron.down").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
@@ -186,6 +198,8 @@ private struct SidebarRow: View {
     let pane: Pane
     let selected: Bool
     let badge: Int
+    var title: String? = nil
+    var symbol: String? = nil
     let dimmed: Bool
     let action: () -> Void
     @State private var hovering = false
@@ -193,12 +207,12 @@ private struct SidebarRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                Image(systemName: pane.symbol)
+                Image(systemName: symbol ?? pane.symbol)
                     .font(.body)
                     .foregroundStyle(Color(pane.tint))
                     .saturation(dimmed ? 0.3 : 1)
                     .frame(width: 22)
-                Text(pane.title)
+                Text(title ?? pane.title)
                     .fontWeight(selected ? .semibold : .regular)
                     .foregroundStyle(dimmed ? .tertiary : .primary)
                 Spacer(minLength: 4)
@@ -252,6 +266,7 @@ private struct PairingBanner: View {
 
 struct NoDeviceView: View {
     @Environment(AppModel.self) private var model
+    private var tv: Bool { model.selectedDevice?.isTV == true }
 
     var body: some View {
         VStack(spacing: 24) {
@@ -268,9 +283,14 @@ struct NoDeviceView: View {
                 }
             case .connected:
                 ContentUnavailableView {
-                    Label(model.pairedDevices.isEmpty ? "Pair your phone" : "Phone not connected", systemImage: "iphone.gen3.radiowaves.left.and.right")
+                    if tv {
+                        Label("TV not connected", systemImage: "tv")
+                    } else {
+                        Label(model.pairedDevices.isEmpty ? "Pair your phone" : "Phone not connected", systemImage: "iphone.gen3.radiowaves.left.and.right")
+                    }
                 } description: {
-                    Text("Open the companion app on your Android phone and keep both devices on the same Wi-Fi network.")
+                    Text(tv ? "Open Janus on your TV and keep both devices on the same Wi-Fi network."
+                            : "Open Janus on your Android phone and keep both devices on the same Wi-Fi network.")
                 } actions: {
                     HStack {
                         Button("Add Device…") { model.showAddDevice = true }

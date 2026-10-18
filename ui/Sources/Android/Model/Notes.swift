@@ -129,6 +129,13 @@ final class NotesStore {
     func delete(_ id: String) { edit(id) { $0.deleted = Note.now; $0.pinned = false } }
     func restore(_ id: String) { edit(id) { $0.deleted = nil } }
 
+    /// A new note left without anything written isn't kept: gone at once if no phone has it yet, else deleted the
+    /// usual way so the phones drop it too (as the phone app does).
+    func discardIfEmpty(_ id: String?) {
+        guard let n = note(id), n.deleted == nil, n.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if acked.values.contains(where: { $0[n.id] != nil }) { delete(n.id) } else { deleteNow(n.id) }
+    }
+
     /// Gone for good here (the phones keep their copy in Recently Deleted until their own 30 days pass).
     func deleteNow(_ id: String) {
         notes.removeAll { $0.id == id }
@@ -162,18 +169,19 @@ final class NotesStore {
 
     /// Our phones that sync notes and are connected.
     func peers() -> [Device] {
-        AppModel.shared.connectedDevices.filter { Self.syncs($0) }
+        // On the LAN, or through Janus Cloud when away (R37).
+        AppModel.shared.pairedDevices.filter { Self.syncs($0) && ($0.isReachable || CloudService.shared.canReach($0)) }
     }
 
     static func syncs(_ d: Device) -> Bool {
-        DeviceTrust.isMine(d) && d.profile?.caps?.contains("notes") == true
+        !d.isTV && DeviceTrust.isMine(d) && d.profile?.caps?.contains("notes") == true
     }
 
     /// The phone connected (its profile arrived): say hello and send what it's missing.
     func connected(_ device: Device) {
         guard !paused, Self.syncs(device) else { return }
         // The profile can arrive a moment before this app has marked the phone connected: try again shortly.
-        guard device.isReachable else {
+        guard device.isReachable || CloudService.shared.canReach(device) else {
             Task { [weak device] in
                 try? await Task.sleep(for: .seconds(2))
                 if let device, device.isReachable { self.connected(device) }
@@ -246,7 +254,7 @@ final class NotesStore {
             for item in o["notes"] as? [[String: Any]] ?? [] {
                 guard let d = try? JSONSerialization.data(withJSONObject: item),
                       let incoming = try? JSONDecoder().decode(Note.self, from: d) else { continue }
-                if apply(incoming, base: item["base"] as? String) { changedHere = true }
+                if apply(incoming, base: item["base"] as? String, senderHad: acked[device.id]?[incoming.id]) { changedHere = true }
                 acked[device.id, default: [:]][incoming.id] = incoming.rev
                 acks.append(["id": incoming.id, "rev": incoming.rev])
             }
@@ -260,14 +268,16 @@ final class NotesStore {
     }
 
     /// Takes a note from a phone. Returns true when something here changed (other peers may need it).
-    private func apply(_ incoming: Note, base: String?) -> Bool {
+    /// `senderHad`: the version the sender already had from us (it sent it, or acked ours). Its `base` can lag
+    /// behind while acks are in flight (edits pushed about a second apart), so that counts as agreeing too.
+    private func apply(_ incoming: Note, base: String?, senderHad: String?) -> Bool {
         guard let i = notes.firstIndex(where: { $0.id == incoming.id }) else {
             notes.append(incoming)
             return true
         }
         let local = notes[i]
         if local.rev == incoming.rev { return false }
-        if base == local.rev {
+        if base == local.rev || senderHad == local.rev {
             notes[i] = incoming
             return true
         }
@@ -316,6 +326,7 @@ final class NotesStore {
 
     func writeNow(sync: Bool = false) {
         saveTask?.cancel(); saveTask = nil
+        NotesWidgets.publish(live)
         let saved = Saved(notes: notes, acked: acked)
         let url = Self.file
         let write = { if let data = try? JSONEncoder().encode(saved) { try? data.write(to: url, options: .atomic) } }

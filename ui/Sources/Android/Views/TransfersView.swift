@@ -90,7 +90,35 @@ struct TransfersView: View {
         .quickLookPreview($preview, in: store.items.compactMap { $0.kind == .file ? $0.url : nil })
     }
 
-    private var sendBar: some View {
+    @ViewBuilder private var sendBar: some View {
+        if !device.isReachable, device.supports("cloud2") {
+            // Through Janus Cloud with a phone that takes links and text there too (R37): everything works.
+            VStack(alignment: .leading, spacing: 10) {
+                Label("\(device.name) isn't on this network: files, links and text go through Janus Cloud.", systemImage: "icloud")
+                    .font(.callout).foregroundStyle(.secondary)
+                reachableSendBar
+            }
+        } else if !device.isReachable {
+            // Through Janus Cloud: files only (links and text need the phone on this network for now).
+            HStack(spacing: 10) {
+                Image(systemName: "icloud").font(.title3).foregroundStyle(Color.janus)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(device.name) isn't on this network. Files go through Janus Cloud.").font(.callout.weight(.medium))
+                    Text("Drop files anywhere in this window, or click \(Image(systemName: "paperplane")) to choose them. Links and text need the phone on the same network.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Button("Send Files…") { picking = true }.controlSize(.large)
+            }
+            .padding(12)
+            .background(Color.janus.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.bottom, 14)
+        } else {
+            reachableSendBar
+        }
+    }
+
+    private var reachableSendBar: some View {
         HStack(spacing: 12) {
             TextField("Paste a link or type text to send", text: $text)
                 .textFieldStyle(.roundedBorder)
@@ -175,6 +203,9 @@ struct TransferCard: View {
         let who = (transfer.direction == .received ? "From " : "To ") + transfer.deviceName
         var parts = [who]
         if let size = transfer.size, transfer.kind == .file { parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)) }
+        // Through Janus Cloud: where it stands ("In the cloud, waiting for …", "Delivered via Cloud").
+        // Through Janus Cloud (the badge shows a cloud): only what's worth saying in words.
+        if transfer.viaCloud == true, transfer.awaitingPickup == true || transfer.state == .failed, let note = transfer.note { parts.append(note) }
         parts.append(transfer.date.formatted(.relative(presentation: .named)))
         return parts.joined(separator: " · ")
     }
@@ -246,14 +277,17 @@ private struct DeviceBadge: View {
                 .fill(badgeColor.gradient)
                 .frame(width: size, height: size)
                 .overlay {
-                    Image(systemName: "smartphone")
-                        .font(.system(size: size * 0.46, weight: .semibold))
+                    // A cloud when it went through Janus Cloud (the devices weren't on the same network).
+                    Image(systemName: transfer.viaCloud == true ? "icloud.fill" : "smartphone")
+                        .font(.system(size: size * (transfer.viaCloud == true ? 0.4 : 0.46), weight: .semibold))
                         .foregroundStyle(.white)
                 }
                 .overlay(Circle().strokeBorder(.background, lineWidth: 3))
                 .shadow(color: .black.opacity(0.2), radius: 3, y: 1)
             Group {
                 switch transfer.state {
+                case .done where transfer.awaitingPickup == true:
+                    Image(systemName: "clock.fill").foregroundStyle(.white, .gray)   // in the cloud, not picked up yet
                 case .done:
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.white, .blue)
                         .transition(.scale.combined(with: .opacity))

@@ -126,6 +126,7 @@ enum DeviceProfiles {
         device.profile = cache[device.id]
         // Sent after each connect: the moment to sync notes.
         NotesStore.shared.connected(device)
+        CloudService.shared.connected(device)
     }
 
     /// What mirroring learned (scrcpy's model name and the screen in px). Never overrides the phone's own report.
@@ -162,8 +163,6 @@ enum DeviceProfiles {
         save()
         device.profile = p
         device.lookVersion += 1
-        Inspector.shared.record("Profile", source: device.name, title: p.displayName ?? "Device profile",
-                                fields: [("profile (JSON)", (try? String(decoding: JSONEncoder.pretty.encode(p), as: UTF8.self)) ?? "")])
     }
 
     private static func save() {

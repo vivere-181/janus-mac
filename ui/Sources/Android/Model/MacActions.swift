@@ -1,3 +1,4 @@
+import JanusLink
 import AppKit
 import KDEConnectKit
 
@@ -20,7 +21,7 @@ enum MacActions {
 
     /// Connected phones known to run our app (they understand `ge.connect.` commands).
     static var ourPhones: [Device] {
-        AppModel.shared.connectedDevices.filter { UserDefaults.standard.bool(forKey: "reportsStatus.\($0.id)") && DeviceTrust.isMine($0) }
+        AppModel.shared.connectedDevices.filter { !$0.isTV && UserDefaults.standard.bool(forKey: "reportsStatus.\($0.id)") && DeviceTrust.isMine($0) }
     }
 
     /// The phone that asked: each phone's command list carries its own device id. Older lists without it
@@ -29,13 +30,15 @@ enum MacActions {
 
     /// Tells the phone that asked how an action went: `ge.connect.macaction:<id>:ok` or `…:failed:<reason>`.
     private static func reply(_ id: String, _ error: String? = nil) {
-        let targets = requester.map { d in ourPhones.filter { $0.id == d.id } } ?? ourPhones
+        // The phone that asked, also when it asked through Janus Cloud (away from this network); else ours nearby.
+        let targets = requester.map { [$0] } ?? ourPhones
         for d in targets { d.command("macaction:\(id):" + (error.map { "failed:" + $0 } ?? "ok")) }
     }
 
     static func perform(_ id: String, deviceID: String? = nil) {
         let devices = AppModel.shared.connectedDevices
-        requester = devices.first { $0.id == deviceID } ?? ourPhones.first ?? devices.first
+        requester = AppModel.shared.devices.first { $0.id == deviceID && ($0.isReachable || CloudService.shared.canReach($0)) }
+            ?? ourPhones.first ?? devices.first
         AppModel.shared.log(.info, "\(requester?.name ?? "Phone") asked this Mac to: \(all.first { $0.id == id }?.name ?? id)")
         let phone = requester
         let from = phone.map { "From \($0.name)" }
@@ -128,8 +131,7 @@ enum MacActions {
     /// commands the owner added), then reloads the plugin so the phone sees the new list.
     static func publish() {
         for device in AppModel.shared.pairedDevices where device.supportedPlugins.contains("kdeconnect_runcommand") {
-            let dir = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Preferences/kdeconnect/\(device.id)/kdeconnect_runcommand", isDirectory: true)
+            let dir = LocalIdentity.folder.appendingPathComponent("\(device.id)/kdeconnect_runcommand", isDirectory: true)
             let file = dir.appendingPathComponent("config")
             var commands = readCommands(file)
             commands = commands.filter { !$0.key.hasPrefix("ge-") }
@@ -184,6 +186,7 @@ enum URLRouter {
                 MacActions.perform(url.lastPathComponent, deviceID: device)
             }
             if url.host() == "share" { shareFromExtension(url) }
+            if url.host() == "notes" { openNotes(url) }
         case "tel", "telprompt", "callto":
             let number = (url.absoluteString.split(separator: ":", maxSplits: 1).last.map(String.init) ?? "")
                 .removingPercentEncoding ?? ""
@@ -191,15 +194,27 @@ enum URLRouter {
             // Calls are placed by our phone app (the dialer opens prefilled), so only phones running it can.
             let canCall = { (d: Device) in d.isReachable && d.has("telephony") && d.supports("dial") }
             guard let device = model.selectedDevice.flatMap({ canCall($0) ? $0 : nil }) ?? model.connectedDevices.first(where: canCall) else {
-                AppModel.shared.log(.warning, "Can't call \(number): no connected phone runs the companion app")
+                AppModel.shared.log(.warning, "Can't call \(number): no connected phone runs Janus")
                 MacPopup.shared.show(.init(symbol: "phone.down", tint: .gray, title: "Can't call from this Mac",
                                            subtitle: model.connectedDevices.isEmpty ? "Your phone isn't connected."
-                                               : "Calling needs the companion app on the phone."))
+                                               : "Calling needs Janus on the phone."))
                 return
             }
             device.dial(number)
             Notifier.shared.calling(number, device: device)
         default: break
+        }
+    }
+
+    /// From the Notes widgets: a note opens in a window of its own (janus://notes/open?id=…), janus://notes/new
+    /// starts one the same way, janus://notes opens the list in the Notes window.
+    private static func openNotes(_ url: URL) {
+        let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "id" }?.value
+        let store = NotesStore.shared
+        switch url.lastPathComponent {
+        case "open" where store.note(id).map { $0.deleted == nil } == true: NoteWindows.show(id!)
+        case "new": NoteWindows.show(store.create().id)
+        default: SceneActions.showMainWindow(.notes)
         }
     }
 
@@ -213,15 +228,20 @@ enum URLRouter {
             .filter { $0.path.hasPrefix(outgoing + "/") && FileManager.default.fileExists(atPath: $0.path) }
         let texts = q.filter { $0.name == "text" }.compactMap(\.value).filter { !$0.isEmpty }
         let model = AppModel.shared
-        guard let device = (model.selectedDevice?.isReachable == true ? model.selectedDevice : nil)
-                ?? model.connectedDevices.first(where: DeviceTrust.isMine) ?? model.connectedDevices.first else {
+        // Away from this network, files still go through Janus Cloud (to the selected phone, if it's set up for it).
+        let viaCloud = model.selectedDevice.flatMap { CloudService.shared.peer(forDevice: $0.id) != nil ? $0 : nil }
+        // Never to a TV (it doesn't take files): the selected phone, else a connected phone.
+        let phones = model.connectedDevices.filter { !$0.isTV }
+        guard let device = (model.selectedDevice?.isReachable == true && model.selectedDevice?.isTV == false ? model.selectedDevice : nil)
+                ?? phones.first(where: DeviceTrust.isMine) ?? phones.first
+                ?? (files.isEmpty ? nil : viaCloud) else {
             MacPopup.shared.show(.init(symbol: "iphone.slash", tint: .gray, title: "Phone not connected",
                                        subtitle: "Nothing was sent. Try again when your phone is connected."))
             return
         }
         if !files.isEmpty { device.share(files) }
-        texts.forEach(device.shareText)
-        let n = files.count + texts.count
+        if device.isReachable { texts.forEach(device.shareText) }
+        let n = files.count + (device.isReachable ? texts.count : 0)
         guard n > 0 else { return }
         let what = n == 1 ? (files.first?.lastPathComponent ?? (texts[0].hasPrefix("http") ? "Link" : "Text")) : "\(n) items"
         MacPopup.shared.show(.init(symbol: "paperplane.fill", tint: .blue, title: "Sending \(what)", subtitle: "To \(device.name)"))

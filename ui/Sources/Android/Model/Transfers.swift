@@ -27,6 +27,10 @@ struct Transfer: Identifiable, Codable, Equatable {
     var batchTotal: Int64?
     /// Extra line shown in the receive popup, e.g. "Screenshot · copied to clipboard".
     var note: String?
+    /// Went through Janus Cloud (the devices weren't on the same network).
+    var viaCloud: Bool?
+    /// Sent to the cloud, not yet taken by the phone (it's away; kept up to 72 hours).
+    var awaitingPickup: Bool?
 
     var progress: Double? {
         guard let size, size > 0 else { return nil }
@@ -265,7 +269,8 @@ final class TransferMonitor {
 
     private func tick() {
         let store = TransferStore.shared
-        guard let pid = KDEConnectEngine.daemonPID() else { sleep(); return }
+        // The engine's open files: it runs inside this app (R40).
+        let pid = getpid()
         let now = ProcessInfo.processInfo.systemUptime
         let open = Self.openFiles(pid: pid)
         let home = FileManager.default.homeDirectoryForCurrentUser.path

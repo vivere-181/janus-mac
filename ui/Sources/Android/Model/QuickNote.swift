@@ -2,8 +2,8 @@ import AppKit
 import Carbon.HIToolbox
 import SwiftUI
 
-/// Quick Note: a small floating note, opened with a keyboard shortcut from anywhere (like macOS's Quick Note) or from
-/// the menu bar panel's Notes section. It's a normal note, synced like every note.
+/// Quick Note: a small floating note, opened with a keyboard shortcut from anywhere (like macOS's Quick Note).
+/// It's a normal note, synced like every note.
 @MainActor
 enum QuickNote {
     private static var panel: NSPanel?
@@ -23,7 +23,7 @@ enum QuickNote {
     static func show(noteID: String? = nil, new: Bool = false, focus: Bool = true) {
         let store = NotesStore.shared
         // Starting another: the current one, if nothing was written, isn't kept.
-        if new, let old = store.note(lastID), old.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { store.deleteNow(old.id) }
+        if new { store.discardIfEmpty(lastID) }
         // Resume the last quick note, like macOS; a new one when it's gone or asked for.
         let note = store.note(noteID).flatMap { $0.deleted == nil ? $0 : nil }
             ?? (!new ? store.note(lastID).flatMap { $0.deleted == nil ? $0 : nil } : nil) ?? store.create()
@@ -44,7 +44,7 @@ enum QuickNote {
         panel?.contentViewController = nil   // the editor and its text go; made again the next time it opens
         // A quick note left empty isn't kept.
         if let n = NotesStore.shared.note(lastID), n.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            NotesStore.shared.deleteNow(n.id)
+            NotesStore.shared.discardIfEmpty(n.id)
             lastID = nil
         }
     }

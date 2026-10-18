@@ -20,8 +20,13 @@ copy apply.sh
 copy ui/Package.swift
 copy ui/Sources/
 copy ui/ShareExtension/
+copy ui/WidgetExtension/
 copy tools/build-ui.sh
 copy tools/package.sh
+copy tools/sign.sh
+copy tools/release.sh
+copy ui/VERSION
+copy ui/Tests/
 copy tools/snap.swift
 copy tools/export-public.sh
 copy assets/Janus.icon/

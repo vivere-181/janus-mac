@@ -26,6 +26,12 @@ struct AndroidApp: App {
         .defaultLaunchBehavior(.suppressed)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { Task { await Updater.shared.check(userInitiated: true) }; UpdateWindow.shared.show() }
+            }
+            CommandGroup(replacing: .help) {
+                Button("Welcome to Janus") { WelcomeWindow.shared.show() }
+            }
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") { SceneActions.showMainWindow(.settings) }
                     .keyboardShortcut(",", modifiers: .command)
@@ -55,21 +61,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         QuickNoteHotKey.shared.register()
         AppIcon.install()
         NoteAttachments.shared.cleanUp()
+        NotesWidgets.start()
+        CloudService.shared.start()
         ClipboardHistory.shared.start()
+        Updater.shared.start()
         // Open the window when the user launches the app, but stay in the menu bar when started at login.
         let event = NSAppleEventManager.shared().currentAppleEvent
         let atLogin = event?.eventID == AEEventID(kAEOpenApplication)
             && event?.paramDescriptor(forKeyword: AEKeyword(keyAEPropData))?.enumCodeValue == OSType(keyAELaunchedAsLogInItem)
-        openOnLaunch = !atLogin && !UserDefaults.standard.bool(forKey: "startHidden")
+        // Nor when launched to open something (a widget's note opens in its own window, a phone action just runs).
+        let defaultLaunch = notification.userInfo?["NSApplicationLaunchIsDefaultLaunchKey"] as? Bool ?? true
+        openOnLaunch = !atLogin && defaultLaunch && !UserDefaults.standard.bool(forKey: "startHidden")
         if openOnLaunch { model?.wantsMainWindow = true }
+        // First launch with nothing paired: the welcome (R41). Decided once the engine has listed the devices.
+        if !UserDefaults.standard.bool(forKey: "welcome.done") {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2))
+                WelcomeWindow.shared.showIfNeeded()
+            }
+        }
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = self
-        // janus://action/… (Mac actions from the phone) and tel: links (click to call).
-        NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURLEvent(_:reply:)),
-                                                     forEventClass: AEEventClass(kInternetEventClass),
-                                                     andEventID: AEEventID(kAEGetURL))
+    }
+
+    /// janus://action/… (Mac actions from the phone), janus://notes/… (the Notes widgets) and tel: links (click to
+    /// call). Through the delegate rather than an Apple event handler of our own: replacing AppKit's left an app
+    /// launched by a link stuck before it finished launching.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        urls.forEach(URLRouter.handle)
     }
 
     /// Finder / right-click "Services" entry (NSMessage = sendToPhone in Info.plist).
@@ -83,11 +104,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if let text = pboard.string(forType: .string) {
             device.shareText(text)
         }
-    }
-
-    @objc func handleURLEvent(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
-        guard let s = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue, let url = URL(string: s) else { return }
-        URLRouter.handle(url)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -106,7 +122,8 @@ enum DockPresence {
 
     @MainActor static func update() {
         if UserDefaults.standard.bool(forKey: "noDockToggle") { return }
-        let visible = NSApp.windows.contains { $0.identifier?.rawValue == "main" && $0.isVisible }
+        // The main window or a note's own window: the app is in the Dock and the app switcher while one is open.
+        let visible = NSApp.windows.contains { $0.isVisible && ($0.identifier?.rawValue == "main" || $0.identifier?.rawValue.hasPrefix("note:") == true) }
         AppModel.shared.uiVisibilityChanged()
         let policy: NSApplication.ActivationPolicy = visible ? .regular : .accessory
         if NSApp.activationPolicy() != policy {

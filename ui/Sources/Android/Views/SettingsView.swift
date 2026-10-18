@@ -50,6 +50,7 @@ private struct GeneralSettings: View {
                     .buttonStyle(.link)
                 }
             }
+            SoftwareUpdateSection()
             Section("Startup") {
                 Toggle("Open at login", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, on in
@@ -70,7 +71,7 @@ private struct GeneralSettings: View {
             PhoneAndCallsSection()
             CalendarSettingsSection()
             NotesSettingsSection()
-            DeveloperSettingsSection()
+            CloudSettingsSection()
             Section("Notifications on This Mac") {
                 if notificationsDenied {
                     Label("Notifications are turned off for Janus in System Settings, so none of these will appear.",
@@ -347,7 +348,7 @@ private struct NotesSettingsSection: View {
                     }
                 }
             }
-            Text("Opens a small note from anywhere: your last quick note, ready to type. Press it again or Esc to put it away. Quick notes sync to your phone like any note. You can also start one from the menu bar.")
+            Text("Opens a small note from anywhere: your last quick note, ready to type. Press it again or Esc to put it away. Quick notes sync to your phone like any note.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .onDisappear { stop() }
@@ -373,13 +374,124 @@ private struct NotesSettingsSection: View {
     }
 }
 
-/// Tools for people working on Janus: simulated notifications and the raw data inspector.
-private struct DeveloperSettingsSection: View {
-    @AppStorage("developer.tools") private var tools = false
+/// Janus Cloud: the owner's relay, for when the phone and this Mac aren't on the same network (shared/CLOUD.md).
+struct CloudSettingsSection: View {
+    @Environment(AppModel.self) private var model
+    @State private var relay = ""
+    @State private var invite = ""
+    @State private var working = false
+    @State private var error: String?
+    @State private var confirmOff = false
+    private var cloud: CloudService { .shared }
 
     var body: some View {
-        Section("Developer") {
-            Toggle("Show testing tools (Testing in the sidebar)", isOn: $tools)
+        Section {
+            if cloud.isSetUp, !needsReconnect {
+                LabeledContent("Relay") {
+                    HStack(spacing: 6) {
+                        Circle().fill(statusColor).frame(width: 7, height: 7)
+                        Text(cloud.relay?.host() ?? "")
+                        Text("· \(statusText)").foregroundStyle(.secondary)
+                    }
+                }
+                LabeledContent("This Mac") { LatencyText(ms: cloud.latency) }
+                ForEach(model.pairedDevices.filter(DeviceTrust.isMine)) { d in
+                    LabeledContent(d.name) {
+                        if let p = cloud.peer(forDevice: d.id), let ms = cloud.peerLatency[p.cloudID] {
+                            LatencyText(ms: ms)
+                        } else {
+                            Text(phoneState(d)).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Button("Turn Off Janus Cloud…", role: .destructive) { confirmOff = true }
+                    .confirmationDialog("Turn off Janus Cloud?", isPresented: $confirmOff) {
+                        Button("Turn Off", role: .destructive) { Task { await cloud.turnOff() } }
+                    } message: {
+                        Text("Your phone and this Mac will only reach each other on the same network again. Files waiting in the cloud are deleted after 72 hours.")
+                    }
+            } else {
+                if case .needsReconnect(let why) = cloud.status {
+                    Label(why, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+                TextField("Relay", text: $relay, prompt: Text("https://relay.example.com"))
+                    .textContentType(.URL)
+                SecureField("Invite", text: $invite, prompt: Text("From your relay's settings"))
+                HStack {
+                    if let error { Text(error).foregroundStyle(.red).font(.callout) }
+                    Spacer()
+                    if working { ProgressView().controlSize(.small) }
+                    Button("Connect") { connect() }
+                        .disabled(working || URL(string: relay)?.host() == nil || invite.count < 16)
+                }
+            }
+        } header: {
+            Text("Janus Cloud")
+        } footer: {
+            Text("Send files to your phone when you're not on the same network, through your own relay. Everything is encrypted on your devices: the relay can't read your files or their names. Your phone joins the next time it's on the same Wi-Fi as this Mac.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .onAppear { if relay.isEmpty { relay = cloud.relay?.absoluteString ?? "" } }
+        // Round trips, every 5 s while this is on screen (nothing runs otherwise).
+        .task(id: cloud.status) {
+            while !Task.isCancelled, cloud.status == .online {
+                await cloud.measureLatency()
+                try? await Task.sleep(for: .seconds(5), tolerance: .seconds(1))
+            }
+        }
+    }
+
+    private var needsReconnect: Bool { if case .needsReconnect = cloud.status { true } else { false } }
+
+    private var statusText: String {
+        switch cloud.status {
+        case .online: "Connected"
+        case .connecting: "Connecting…"
+        case .offline(let why): why
+        case .needsReconnect: "Set up again"
+        case .off: "Off"
+        }
+    }
+
+    private var statusColor: Color {
+        switch cloud.status {
+        case .online: .green
+        case .connecting, .offline: .orange
+        default: .gray
+        }
+    }
+
+    private func phoneState(_ d: Device) -> String {
+        if cloud.peer(forDevice: d.id) != nil { return d.isReachable ? "On this network" : "Not connected to the cloud" }
+        if d.isReachable, !d.supports("cloud") { return "Needs the latest Janus on the phone" }
+        return "Joins next time it's on the same Wi-Fi"
+    }
+
+    private func connect() {
+        guard let url = URL(string: relay.trimmingCharacters(in: .whitespaces)) else { return }
+        working = true; error = nil
+        Task {
+            do { try await cloud.setUp(relay: url, invite: invite); invite = "" }
+            catch { self.error = error.localizedDescription }
+            working = false
         }
     }
 }
+
+/// "48 ms" with a dot: green under 100 ms, yellow under 250, orange above (like a network quality hint).
+private struct LatencyText: View {
+    let ms: Int?
+    var body: some View {
+        if let ms {
+            HStack(spacing: 5) {
+                Circle().fill(ms < 100 ? Color.green : ms < 250 ? .yellow : .orange).frame(width: 6, height: 6)
+                Text("\(ms) ms").monospacedDigit().foregroundStyle(.secondary)
+                    .contentTransition(.numericText(value: Double(ms)))
+                    .animation(.snappy, value: ms)
+            }
+        } else {
+            Text("—").foregroundStyle(.tertiary)
+        }
+    }
+}
+

@@ -553,13 +553,16 @@ final class NoteTextView: NSTextView {
             guard columns > 0 else { continue }
             // Pass 1: style each cell (spaces take no room, inline markup hidden) and measure it as shown.
             var textRanges: [[NSRange]] = []
+            /// Per cell, the character the column's spare room goes after: the hidden space that ends the cell, so
+            /// the caret at the end of the text (or in an empty cell) stays by the text, not at the column's edge.
+            var stretchAt: [[NSRange]] = []
             var widths = [CGFloat](repeating: 44, count: columns)
             for (row, cells) in zip(rows, cellsPerRow) {
                 let line = NSRange(location: row.range.location, length: min(row.range.length + 1, s.length - row.range.location))
                 let p = NSMutableParagraphStyle(); p.paragraphSpacingBefore = 5; p.paragraphSpacing = 5
                 p.tabStops = []; p.defaultTabInterval = 0.01   // a stray tab in a cell takes no room
                 storage.addAttribute(.paragraphStyle, value: p, range: line)
-                var rowTexts: [NSRange] = []
+                var rowTexts: [NSRange] = [], rowStretch: [NSRange] = []
                 for (c, r) in cells.enumerated() {
                     storage.addAttribute(.foregroundColor, value: NSColor.clear, range: NSRange(location: r.location - 1, length: 1))
                     let cell = s.substring(with: r) as NSString
@@ -571,25 +574,29 @@ final class NoteTextView: NSTextView {
                     styleInline(MDLine(range: textRange, kind: .body, tabs: 0), reveal: false, in: storage, s: s)
                     widths[c] = max(widths[c], min(260, shownWidth(textRange, storage) + 2 * pad))
                     rowTexts.append(textRange)
+                    let caretAt = caret(in: r).location
+                    rowStretch.append(r.length > 0 && r.upperBound - 1 >= caretAt ? NSRange(location: r.upperBound - 1, length: 1)
+                                      : textRange.length > 0 ? NSRange(location: textRange.upperBound - 1, length: 1)
+                                      : NSRange(location: r.location - 1, length: 1))
                 }
                 if let last = cells.last {
                     storage.addAttribute(.foregroundColor, value: NSColor.clear, range: NSRange(location: last.upperBound, length: 1))
                 }
                 textRanges.append(rowTexts)
+                stretchAt.append(rowStretch)
             }
             var edges: [CGFloat] = [0]
             for w in widths { edges.append(edges.last! + pipe + w) }
             // Pass 2: the pipe before each cell carries its left padding; the end of its text is stretched so the
             // next pipe lands on the column's right edge.
-            for (cells, texts) in zip(cellsPerRow, textRanges) {
+            for ((cells, texts), stretches) in zip(zip(cellsPerRow, textRanges), stretchAt) {
                 for (c, r) in cells.enumerated() {
                     let pipeBefore = NSRange(location: r.location - 1, length: 1)
                     storage.addAttribute(.kern, value: pad, range: pipeBefore)
-                    let text = texts[c]
-                    let room = max(0, (edges[c + 1] - edges[c]) - pipe - pad - shownWidth(text, storage))
-                    let stretchAt = text.length > 0 ? NSRange(location: text.upperBound - 1, length: 1) : pipeBefore
-                    let existing = (storage.attribute(.kern, at: stretchAt.location, effectiveRange: nil) as? CGFloat) ?? 0
-                    storage.addAttribute(.kern, value: existing + room, range: stretchAt)
+                    let room = max(0, (edges[c + 1] - edges[c]) - pipe - pad - shownWidth(texts[c], storage))
+                    let at = stretches[c]
+                    let existing = (storage.attribute(.kern, at: at.location, effectiveRange: nil) as? CGFloat) ?? 0
+                    storage.addAttribute(.kern, value: existing + room, range: at)
                 }
             }
             tables.append(TableLayout(rows: rows, edges: edges))
@@ -759,12 +766,24 @@ final class NoteTextView: NSTextView {
 
     // MARK: Drawing (boxes, bullets, quote bars, code blocks)
 
+    /// Where a marker's characters are on their line: from where the glyphs are placed, as tall as body text on that
+    /// line's baseline. (The glyphs' bounding rect also takes in the line's other fonts: a checklist item in Georgian
+    /// had its box drawn 10 pt to the left and lower than the text.)
     private func rect(_ r: NSRange) -> NSRect? {
-        guard let lm = layoutManager, let tc = textContainer, r.length > 0 else { return nil }
+        guard let lm = layoutManager, r.length > 0 else { return nil }
         let glyphs = lm.glyphRange(forCharacterRange: r, actualCharacterRange: nil)
-        var rect = lm.boundingRect(forGlyphRange: glyphs, in: tc)
-        rect.origin.x += textContainerOrigin.x; rect.origin.y += textContainerOrigin.y
-        return rect
+        guard glyphs.length > 0 else { return nil }
+        let frag = lm.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
+        let start = lm.location(forGlyphAt: glyphs.location)
+        let end = NSMaxRange(glyphs)
+        // The end: where the next glyph on the same line starts, or the end of the line's text.
+        let x1 = end < lm.numberOfGlyphs && lm.lineFragmentRect(forGlyphAt: end, effectiveRange: nil).minY == frag.minY
+            ? frag.minX + lm.location(forGlyphAt: end).x
+            : lm.lineFragmentUsedRect(forGlyphAt: glyphs.location, effectiveRange: nil).maxX
+        let font = Self.bodyFont
+        let baseline = frag.minY + start.y
+        return NSRect(x: textContainerOrigin.x + frag.minX + start.x, y: textContainerOrigin.y + baseline - font.ascender,
+                      width: max(0, x1 - frag.minX - start.x), height: font.ascender - font.descender + font.leading)
     }
 
     /// The whole line as laid out (its full height, including what an attachment reserves), across the text width.
@@ -781,9 +800,40 @@ final class NoteTextView: NSTextView {
         return rect
     }
 
+    /// Testing aid: where the caret is drawn, and the first table's column borders (both from the view's left).
+    func debugCaret() -> String {
+        guard let window else { return "-" }
+        let screen = firstRect(forCharacterRange: NSRange(location: selectedRange().location, length: 0), actualRange: nil)
+        let x = convert(window.convertFromScreen(screen).origin, from: nil).x
+        let x0 = textContainerOrigin.x + (textContainer?.lineFragmentPadding ?? 5)
+        return "caret x \(Int(x)) | borders \(tables.first.map { $0.edges.map { "\(Int(x0 + $0))" }.joined(separator: " ") } ?? "-")"
+    }
+
+    /// Testing aid: where each line's marker, box and text are laid out, and the marker's fonts.
+    func debugLayout() -> [String] {
+        let s = string as NSString
+        return parsed.compactMap { l in
+            guard let m = l.marker else { return nil }
+            var fonts: [String] = []
+            textStorage?.enumerateAttribute(.font, in: m) { v, r, _ in fonts.append("\((v as? NSFont)?.fontName ?? "-")×\(r.length)") }
+            let content = l.range.upperBound > m.upperBound ? rect(NSRange(location: m.upperBound, length: 1)) : nil
+            var chars: [String] = []
+            if let lm = layoutManager {
+                for k in l.range.location..<min(l.range.upperBound, l.range.location + 9) {
+                    let g = lm.glyphIndexForCharacter(at: k)
+                    let x = lm.location(forGlyphAt: g).x + lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil).minX
+                    let f = (textStorage?.attribute(.font, at: k, effectiveRange: nil) as? NSFont)?.fontName.prefix(14) ?? "-"
+                    chars.append("\(s.substring(with: NSRange(location: k, length: 1)))@\(Int(x))[\(f)]")
+                }
+            }
+            debugLog("    glyphs: " + chars.joined(separator: " "))
+            return "\(s.substring(with: l.range).prefix(12)) | marker \(rect(m).map { "\(Int($0.minX))–\(Int($0.maxX))" } ?? "-") box \(boxRect(l).map { "\(Int($0.minX)),\(Int($0.midY)) d\(String(format: "%.1f", $0.width))" } ?? "-") text \(content.map { "\(Int($0.minX))" } ?? "-") fonts \(fonts)"
+        }
+    }
+
     private func boxRect(_ l: MDLine) -> NSRect? {
         guard let m = l.marker, let r = rect(NSRange(location: m.location, length: min(5, m.length))) else { return nil }
-        let d = min(r.height * 0.85, 17)
+        let d = min(r.height * 0.97, 17)   // about 16 pt next to 14 pt text
         return NSRect(x: r.minX + 1, y: r.midY - d / 2, width: d, height: d)
     }
 
