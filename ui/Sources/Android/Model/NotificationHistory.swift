@@ -61,8 +61,10 @@ final class NotificationHistory {
             entries[i].appName = n.appName; entries[i].title = n.title; entries[i].text = n.text
             entries[i].lastSeen = now
             if let icon = copyIcon(n.iconPath) { entries[i].iconFile = icon }
+            // save() prunes expired entries, which can shift `i`: read what we need first.
+            let posted = entries[i].postedAt
             save()
-            return entries[i].postedAt
+            return posted
         }
         entries.insert(Entry(deviceID: device.id, key: key, appName: n.appName, title: n.title, text: n.text,
                              iconFile: copyIcon(n.iconPath), postedAt: n.postedAt, lastSeen: now), at: 0)

@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import Network
 import Observation
+import os
 
 /// Janus Cloud on the Mac (shared/CLOUD.md): this Mac's keys, the relay connection, and the paired phones it can
 /// reach through the relay when they aren't on the same network. Keys are exchanged only over the LAN pairing.
@@ -415,9 +416,15 @@ final class CloudService {
         peerLatency = found
     }
 
+    /// URLSession can call a ping's handler twice (when the connection drops with the ping pending), so only the
+    /// first call resumes.
     private static func ping(_ ws: URLSessionWebSocketTask) async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            ws.sendPing { error in error.map { c.resume(throwing: $0) } ?? c.resume() }
+            let once = OSAllocatedUnfairLock(initialState: false)
+            ws.sendPing { error in
+                guard once.withLock({ done in defer { done = true }; return !done }) else { return }
+                error.map { c.resume(throwing: $0) } ?? c.resume()
+            }
         }
     }
 
