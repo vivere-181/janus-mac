@@ -17,7 +17,8 @@ final class CallPopup {
     }
 
     private(set) var call: Call?
-    var composing = false
+    /// Writing a message instead of answering; the cards take the keyboard only while composing.
+    var composing = false { didSet { if composing != oldValue { PopupHost.shared.refresh() } } }
     var muted = false
     /// Set once the call is answered on the phone: the popup becomes a live call card.
     private(set) var started: Date?

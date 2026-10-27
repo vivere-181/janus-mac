@@ -267,6 +267,14 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
             if model.wantsMainWindow { pendingMainWindow = true }
             _ = model.connectedDevices.map(\.live)
             _ = model.connectedDevices.map(\.activeCall)
+            // What the signs and the battery, transfer and unread parts show.
+            for d in model.connectedDevices {
+                _ = (d.batteryCharge, d.isCharging, d.phoneDND, d.networkType, d.networkStrength, d.unreadCount)
+            }
+            _ = model.pairedDevices.count
+            _ = TransferStore.shared.items
+            _ = MirrorController.shared.isActive
+            _ = CloudService.shared.status
         } onChange: {
             Task { @MainActor in self.observeModel() }
         }
@@ -274,56 +282,80 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
         updateLiveLabel()
     }
 
-    // MARK: Live activity next to the icon
+    // MARK: What shows next to the icon
 
     private var liveTimer: Timer?
     static var showsLiveLabel: Bool { UserDefaults.standard.object(forKey: "live.menuBar") as? Bool ?? true }
 
-    /// "8 min", "12:04" or "62%" next to the icon while something is live on the phone.
-    /// The label currently shown (to skip redrawing an unchanged one).
+    /// Missed calls since the panel or the window was last open (the unread dot).
+    var missedCalls = 0 { didSet { if missedCalls != oldValue { updateLiveLabel() } } }
+
+    /// What the item shows (to skip redrawing an unchanged one).
     private var shownLabel = ""
 
+    /// Text next to the icon, one thing at a time, most important first: a call, a meeting starting now, a live
+    /// activity, a file transfer, the next meeting, the phone's battery. Small signs sit by the logo meanwhile:
+    /// the unread dot, Do Not Disturb, mirroring, Janus Cloud, weak signal (Settings → Menu Bar).
     func updateLiveLabel() {
         guard let item, let button = item.button else { return }
-        let activity = Self.showsLiveLabel ? AppModel.shared.connectedDevices.lazy.compactMap(\.headlineActivity).first : nil
-        let call = Self.showsLiveLabel ? AppModel.shared.connectedDevices.lazy.compactMap(\.activeCall).first : nil
+        let model = AppModel.shared
+        let phone = model.connectedDevices.first(where: DeviceTrust.isMine) ?? model.connectedDevices.first
+        let activity = Self.showsLiveLabel ? model.connectedDevices.lazy.compactMap(\.headlineActivity).first : nil
+        let call = Self.showsLiveLabel ? model.connectedDevices.lazy.compactMap(\.activeCall).first : nil
         let calendar = CalendarStore.shared
         let now = Date()
-        // An event starting right now briefly beats a live activity; otherwise the calendar comes last.
+        // An event starting right now briefly beats a live activity; otherwise the calendar comes after it.
         let imminent = call == nil ? calendar.imminent(at: now) : nil
         let liveText = activity?.label(at: now)
-        let meeting = call != nil ? nil : imminent ?? (liveText == nil ? calendar.headline(at: now) : nil)
+        let transfer = MenuBarPrefs.transfers ? Self.transferLabel() : nil
         // The tooltip names whatever the text had to leave out.
         let alsoMeeting = liveText != nil && imminent == nil ? calendar.headline(at: now)?.text : nil
         let alsoLive = imminent != nil ? liveText.map { t in [activity?.title, t].compactMap { $0 }.joined(separator: " ") } : nil
-        // What the item should show; the menu bar is only touched when it changes (a tick usually changes nothing).
-        let label: (text: String, tooltip: String?, green: Bool)?
+        var label: Label?
         if let call {
-            label = (" " + CallTimer.format(Date().timeIntervalSince(call.start)), "On call with \(call.name.isEmpty ? call.number : call.name)", true)
-        } else if let meeting, imminent != nil || liveText == nil {
-            label = (" " + meeting.text, (["\(meeting.event.title) · \(meeting.event.timeRange)"] + [alsoLive].compactMap { $0 }).joined(separator: "\n"), false)
+            label = Label(text: CallTimer.format(Date().timeIntervalSince(call.start)),
+                          tooltip: "On call with \(call.name.isEmpty ? call.number : call.name)", green: true)
+        } else if let imminent {
+            label = Label(text: imminent.text, tooltip: (["\(imminent.event.title) · \(imminent.event.timeRange)"] + [alsoLive].compactMap { $0 })
+                .joined(separator: "\n"))
         } else if let text = liveText {
-            label = (" " + text, ([[activity?.app, activity?.title].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")]
-                                  + [alsoMeeting].compactMap { $0 }).joined(separator: "\n"), false)
+            label = Label(text: text, tooltip: ([[activity?.app, activity?.title].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")]
+                                                + [alsoMeeting].compactMap { $0 }).joined(separator: "\n"))
+        } else if let transfer {
+            label = transfer
+        } else if let meeting = calendar.headline(at: now) {
+            label = Label(text: meeting.text, tooltip: "\(meeting.event.title) · \(meeting.event.timeRange)")
         } else {
-            label = nil
+            label = Self.batteryLabel(phone)
         }
-        let key = label.map { "\($0.green)|\($0.text)|\($0.tooltip ?? "")" } ?? ""
+
+        let unread = MenuBarPrefs.unread ? (phone?.unreadCount ?? 0) : 0
+        let missed = MenuBarPrefs.unread ? missedCalls : 0
+        let signs = Self.signs(phone: phone)
+        let notes = [unread > 0 ? (unread == 1 ? "1 unread conversation" : "\(unread) unread conversations") : nil,
+                     missed > 0 ? (missed == 1 ? "1 missed call" : "\(missed) missed calls") : nil].compactMap { $0 }
+        let tooltip = ([label?.tooltip].compactMap { $0 } + notes + signs.map(\.tip)).joined(separator: "\n")
+        let dot = unread + missed > 0
+
+        // The menu bar is only touched when something changed (a tick usually changes nothing).
+        let key = [label.map { "\($0.green)|\($0.symbol ?? "")|\($0.text)" } ?? "", "\(dot)",
+                   signs.map { "\($0.symbol)\($0.level ?? -1)" }.joined(separator: ","), tooltip].joined(separator: "|")
         if key != shownLabel {
             shownLabel = key
+            button.image = Self.composite(dot: dot, signs: signs, labelSymbol: label?.symbol)
             if let label {
                 item.length = NSStatusItem.variableLength
                 button.imagePosition = .imageLeading
                 var attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .medium)]
                 if label.green { attrs[.foregroundColor] = NSColor.systemGreen }
-                button.attributedTitle = NSAttributedString(string: label.text, attributes: attrs)
-                button.toolTip = label.tooltip
+                button.attributedTitle = NSAttributedString(string: " " + label.text, attributes: attrs)
             } else {
                 button.title = ""
                 button.imagePosition = .imageOnly
-                button.toolTip = nil
-                item.length = NSStatusItem.squareLength
+                item.length = signs.isEmpty ? NSStatusItem.squareLength : NSStatusItem.variableLength
             }
+            button.toolTip = tooltip.isEmpty ? nil : tooltip
+            button.setAccessibilityLabel((["Janus"] + [label?.tooltip].compactMap { $0 } + notes + signs.map(\.tip)).joined(separator: ", "))
         }
         // A running clock ticks every second; a calendar countdown (whole minutes) every 30 s; nothing else ticks.
         let interval: TimeInterval? = call != nil || activity?.needsTicking(at: .now) == true ? 1
@@ -338,6 +370,102 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
                 liveTimer = t
             }
         }
+    }
+
+    /// The text next to the icon, with an optional symbol before it (battery, transfer direction).
+    private struct Label {
+        var text: String
+        var tooltip: String?
+        var green = false
+        var symbol: String? = nil
+    }
+
+    /// A small sign by the logo; `level` fills a variable symbol (signal bars).
+    private struct Sign {
+        let symbol: String
+        var level: Double? = nil
+        let tip: String
+    }
+
+    /// Files on their way, as one percentage ("↓ 42%"); links and texts are instant, and files waiting in the cloud
+    /// for the phone to come back aren't "on their way".
+    private static func transferLabel() -> Label? {
+        let active = TransferStore.shared.active.filter { $0.kind == .file && $0.awaitingPickup != true }
+        guard !active.isEmpty else { return nil }
+        let sized = active.filter { ($0.size ?? 0) > 0 }
+        let total = sized.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
+        let done = sized.reduce(Int64(0)) { $0 + min($1.bytesDone, $1.size ?? 0) }
+        let receiving = active.allSatisfy { $0.direction == .received }, sending = active.allSatisfy { $0.direction == .sent }
+        let what = active.count == 1 ? active[0].name : "\(active.count) files"
+        return Label(text: total > 0 ? "\(Int(Double(done) / Double(total) * 100))%" : "…",
+                     tooltip: "\(receiving ? "Receiving" : sending ? "Sending" : "Transferring") \(what)",
+                     symbol: receiving ? "arrow.down" : sending ? "arrow.up" : "arrow.up.arrow.down")
+    }
+
+    /// The phone's battery: when low (and not charging), always, or never.
+    private static func batteryLabel(_ phone: Device?) -> Label? {
+        guard let phone, let level = phone.batteryCharge else { return nil }
+        switch MenuBarPrefs.battery {
+        case .never: return nil
+        case .low: guard level <= MenuBarPrefs.lowBattery, !phone.isCharging else { return nil }
+        case .always: break
+        }
+        return Label(text: "\(level)%", tooltip: "\(phone.name): battery \(level)%\(phone.isCharging ? ", charging" : "")",
+                     symbol: BatteryView(charge: level, charging: phone.isCharging).symbol)
+    }
+
+    private static func signs(phone: Device?) -> [Sign] {
+        let model = AppModel.shared
+        var signs: [Sign] = []
+        if MenuBarPrefs.dnd, let phone, phone.phoneDND == true {
+            signs.append(Sign(symbol: "moon.fill", tip: "Do Not Disturb is on on \(phone.name)"))
+        }
+        if MenuBarPrefs.mirroring, MirrorController.shared.isActive {
+            signs.append(Sign(symbol: "rectangle.on.rectangle", tip: "Mirroring \(MirrorController.shared.device?.name ?? "your phone")"))
+        }
+        if MenuBarPrefs.cloud, model.connectedDevices.isEmpty,
+           let away = model.pairedDevices.first(where: { DeviceTrust.isMine($0) && CloudService.shared.canReach($0) }) {
+            signs.append(Sign(symbol: "cloud.fill", tip: "\(away.name) isn't on this network: reachable through Janus Cloud"))
+        }
+        if MenuBarPrefs.signal, let phone, !phone.networkType.isEmpty, (0...1).contains(phone.networkStrength) {
+            signs.append(Sign(symbol: "cellularbars", level: Double(phone.networkStrength) / 4,
+                              tip: phone.networkStrength == 0 ? "\(phone.name) has no mobile signal" : "\(phone.name) has a weak mobile signal"))
+        }
+        return signs
+    }
+
+    /// The logo with its dot and signs as one template image, so it takes the menu bar's own colours.
+    private static func composite(dot: Bool, signs: [Sign], labelSymbol: String?) -> NSImage {
+        let logo = MenuBarLabel.icon
+        guard dot || !signs.isEmpty || labelSymbol != nil else { return logo }
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        func symbol(_ name: String, _ level: Double?) -> NSImage? {
+            let base = level.map { NSImage(systemSymbolName: name, variableValue: $0, accessibilityDescription: nil) }
+                ?? NSImage(systemSymbolName: name, accessibilityDescription: nil)
+            return base?.withSymbolConfiguration(config)
+        }
+        let parts = signs.compactMap { symbol($0.symbol, $0.level) } + [labelSymbol.flatMap { symbol($0, nil) }].compactMap { $0 }
+        let gap: CGFloat = 5
+        let height = ceil(max(logo.size.height, parts.map(\.size.height).max() ?? 0))
+        let dotWidth: CGFloat = dot ? 6 : 0
+        let width = ceil(logo.size.width + dotWidth + parts.reduce(0) { $0 + gap + $1.size.width })
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.lockFocus()
+        var x: CGFloat = 0
+        for (i, part) in ([logo] + parts).enumerated() {
+            let y = ((height - part.size.height) / 2).rounded()
+            part.draw(in: NSRect(x: x, y: y, width: part.size.width, height: part.size.height))
+            if i == 0, dot {
+                // A dot just off the logo's top-right corner (the logo stays whole), like a badge.
+                NSColor.black.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x + part.size.width + 1, y: y + part.size.height - 5, width: 5, height: 5)).fill()
+                x += dotWidth
+            }
+            x += part.size.width + gap
+        }
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
     }
 
     func sceneActionsReady() { openMainWindowIfReady() }
@@ -430,3 +558,26 @@ extension StatusItemController: NSStatusItemExpandedInterfaceDelegate {
     }
 }
 #endif
+
+/// What the menu bar item may show besides the logo (Settings → Menu Bar). Calls, live activities and the calendar
+/// have their own switches (`live.menuBar`, `calendar.menuBar`).
+@MainActor
+enum MenuBarPrefs {
+    enum Battery: String, CaseIterable { case low, always, never }
+    static let lowBattery = 20
+
+    static var unread: Bool { flag("menuBar.unread") }
+    static var battery: Battery { UserDefaults.standard.string(forKey: "menuBar.battery").flatMap(Battery.init) ?? .low }
+    static var transfers: Bool { flag("menuBar.transfers") }
+    static var mirroring: Bool { flag("menuBar.mirroring") }
+    static var dnd: Bool { flag("menuBar.dnd") }
+    static var cloud: Bool { flag("menuBar.cloud") }
+    static var signal: Bool { flag("menuBar.signal") }
+
+    static func flag(_ key: String) -> Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
+
+    static func set(_ key: String, _ value: Any) {
+        UserDefaults.standard.set(value, forKey: key)
+        StatusItemController.shared.updateLiveLabel()
+    }
+}

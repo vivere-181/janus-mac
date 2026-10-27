@@ -167,6 +167,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// removes itself after a minute.
     func call(event: String, number: String, contactName: String, device: Device) {
         let ringing = event == "callReceived" || event == "ringing"
+        // The menu bar's unread dot, until the panel or the window is opened (already open: seen).
+        if event == "missedCall", DeviceTrust.isMine(device), !AppModel.uiVisible { StatusItemController.shared.missedCalls += 1 }
         guard Self.isOn(.calls), ringing || event == "missedCall" else { return }
         let ringingID = "call.\(device.id).\(number).ringing"
         let c = UNMutableNotificationContent()

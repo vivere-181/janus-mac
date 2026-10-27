@@ -72,6 +72,7 @@ private struct GeneralSettings: View {
             CalendarSettingsSection()
             NotesSettingsSection()
             CloudSettingsSection()
+            MenuBarSettingsSection()
             Section("Notifications on This Mac") {
                 if notificationsDenied {
                     Label("Notifications are turned off for Janus in System Settings, so none of these will appear.",
@@ -102,9 +103,6 @@ private struct GeneralSettings: View {
                     get: { ClipboardHistory.enabled },
                     set: { UserDefaults.standard.set($0, forKey: "clipboard.history"); if !$0 { ClipboardHistory.shared.clear() }
                           ClipboardHistory.shared.updateRunning() }))
-                Toggle("Show live activities next to the menu bar icon", isOn: Binding(
-                    get: { StatusItemController.showsLiveLabel },
-                    set: { UserDefaults.standard.set($0, forKey: "live.menuBar"); StatusItemController.shared.updateLiveLabel() }))
                 Toggle("Copy verification codes automatically", isOn: Binding(
                     get: { UserDefaults.standard.bool(forKey: "codes.autoCopy") },
                     set: { UserDefaults.standard.set($0, forKey: "codes.autoCopy") }))
@@ -495,3 +493,40 @@ private struct LatencyText: View {
     }
 }
 
+
+/// Settings → General → Menu Bar: what shows next to the Janus icon.
+private struct MenuBarSettingsSection: View {
+    @Bindable private var calendar = CalendarStore.shared
+    @AppStorage("live.menuBar") private var live = true
+    @AppStorage("menuBar.transfers") private var transfers = true
+    @AppStorage("menuBar.battery") private var battery = MenuBarPrefs.Battery.low.rawValue
+    @AppStorage("menuBar.unread") private var unread = true
+    @AppStorage("menuBar.mirroring") private var mirroring = true
+    @AppStorage("menuBar.dnd") private var dnd = true
+    @AppStorage("menuBar.cloud") private var cloud = true
+    @AppStorage("menuBar.signal") private var signal = true
+
+    var body: some View {
+        Section {
+            Toggle("Calls and live activities", isOn: $live)
+            Toggle("Next meeting", isOn: $calendar.showInMenuBar)
+            Toggle("File transfers", isOn: $transfers)
+            Picker("Phone battery", selection: $battery) {
+                Text("When low (\(MenuBarPrefs.lowBattery)% or less)").tag(MenuBarPrefs.Battery.low.rawValue)
+                Text("Always").tag(MenuBarPrefs.Battery.always.rawValue)
+                Text("Never").tag(MenuBarPrefs.Battery.never.rawValue)
+            }
+            Toggle("Dot for unread messages and missed calls", isOn: $unread)
+            Toggle("Mirroring", isOn: $mirroring)
+            Toggle("Phone in Do Not Disturb", isOn: $dnd)
+            Toggle("Reaching your phone through Janus Cloud", isOn: $cloud)
+            Toggle("Weak mobile signal", isOn: $signal)
+        } header: {
+            Text("Menu Bar")
+        } footer: {
+            Text("Text next to the icon shows one thing at a time, the most important first. Icons sit beside it.")
+        }
+        .onChange(of: [live, transfers, unread, mirroring, dnd, cloud, signal]) { StatusItemController.shared.updateLiveLabel() }
+        .onChange(of: battery) { StatusItemController.shared.updateLiveLabel() }
+    }
+}

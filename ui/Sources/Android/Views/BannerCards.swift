@@ -74,7 +74,8 @@ final class BannerCenter {
     /// Important first, then newest first.
     private(set) var banners: [Banner] = []
     var hovering = false
-    var replyingTo: String?
+    /// The card whose reply field is open; the cards take the keyboard only while there is one.
+    var replyingTo: String? { didSet { if replyingTo != oldValue { PopupHost.shared.refresh() } } }
     /// Folded notifications ("+N more") are shown in full.
     var expanded = false
     @ObservationIgnored private var expiries: [String: Date] = [:]
@@ -194,7 +195,6 @@ struct BannerCard: View {
                 HStack(spacing: 8) {
                     if banner.reply != nil {
                         PopupButton(title: "Reply", role: banner.actions.contains(where: \.primary) ? .secondary : .primary(.janus)) {
-                            NSApp.activate()
                             BannerCenter.shared.replyingTo = banner.id
                         }
                     }

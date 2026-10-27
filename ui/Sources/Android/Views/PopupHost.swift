@@ -2,84 +2,128 @@ import AppKit
 import SwiftUI
 
 /// The one popup under the menu bar icon. Calls, calendar reminders, received files and Mac messages each keep
-/// their own state; this shows whichever are active as a stack of cards in a single popover (most important
+/// their own state; this shows whichever are active as a stack of cards in a single panel (most important
 /// first), so they never cover or replace each other.
 /// - Held (not shown) while the menu bar panel is open (it shows the same things) and while the Mac is locked;
 ///   shown again when the panel closes or the Mac unlocks, if anything is still active.
 /// - Order: call, Mac messages that need an answer, calendar reminders, received files, other Mac messages.
+/// - Like a notification, it never takes the keyboard from what you're working on (an NSPopover does, the moment
+///   it appears): only while you type a reply, and it hands the keyboard back when you're done.
 @MainActor
-final class PopupHost: NSObject, NSPopoverDelegate {
+final class PopupHost {
     static let shared = PopupHost()
 
-    private var popover: NSPopover?
-    private var anchorWindow: NSWindow?
+    private var panel: CardPanel?
 
-    var isShown: Bool { popover?.isShown == true }
+    var isShown: Bool { panel?.isVisible == true }
     /// The popup's window (diagnostics).
-    var window: NSWindow? { popover?.contentViewController?.view.window }
+    var window: NSWindow? { panel }
 
     var hasCards: Bool {
         CallPopup.shared.call != nil || MacPopup.shared.content != nil
             || !CalendarPopup.shared.cards.isEmpty || ReceivePopup.shared.isActive || !BannerCenter.shared.banners.isEmpty
     }
 
-    /// Whether a popup can appear at all (a notification is used otherwise).
-    var canShow: Bool { !MacState.isLocked && anchor() != nil }
+    /// A reply is being written in one of the cards: the only time they take the keyboard.
+    private var typing: Bool { BannerCenter.shared.replyingTo != nil || CallPopup.shared.composing }
 
-    /// Shows, resizes or closes the popup to match what's active.
+    /// Whether a popup can appear at all (a notification is used otherwise).
+    var canShow: Bool { !MacState.isLocked && ReceivePopup.statusItemFrame() != nil }
+
+    /// Shows, resizes or closes the popup to match what's active, and gives or returns the keyboard.
     func refresh() {
         guard hasCards, !StatusItemController.shared.isPanelShown, !MacState.isLocked else {
-            if isShown { popover?.performClose(nil) }
+            close(animated: true)
             return
         }
-        guard let anchor = anchor() else { return }
-        let p = popover ?? {
-            let p = NSPopover()
-            p.behavior = .applicationDefined      // stays until its cards are done or dismissed
-            p.animates = true
-            p.delegate = self
-            let host = NSHostingController(rootView: PopupStack().tint(.janus))
-            host.sizingOptions = [.preferredContentSize]
-            p.contentViewController = host
-            return p
-        }()
-        popover = p
-        if !p.isShown { p.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY) }
+        guard let icon = ReceivePopup.statusItemFrame() else { return }
+        let p = panel ?? CardPanel()
+        panel = p
+        p.anchor = icon
+        if !p.isVisible {
+            p.fit()
+            p.alphaValue = 0
+            p.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.2; p.animator().alphaValue = 1 }
+        }
+        if typing, !p.isKeyWindow {
+            p.makeKey()
+        } else if !typing, p.isKeyWindow {
+            // Ordering out hands the keyboard back to the window you were in; back in front at once, unchanged.
+            p.orderOut(nil)
+            p.orderFrontRegardless()
+        }
     }
 
     /// The menu bar panel is opening: out of its way at once, without animation (the cards are kept).
-    func stepAside() {
-        guard let p = popover, p.isShown else { return }
-        p.animates = false
-        p.close()
-        popoverDidClose(Notification(name: NSPopover.didCloseNotification))
+    func stepAside() { close(animated: false) }
+
+    /// Closed and released: a hidden one keeps its views (and their timers) alive.
+    private func close(animated: Bool) {
+        guard let p = panel else { return }
+        panel = nil
+        guard animated, p.isVisible else { p.orderOut(nil); p.contentView = nil; return }
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.18; p.animator().alphaValue = 0 }
+        Task {
+            try? await Task.sleep(for: .seconds(0.2))
+            p.orderOut(nil)
+            p.contentView = nil
+        }
+    }
+}
+
+/// The cards' window: under the menu bar icon (centred on it, kept on screen), above other windows on every Space.
+/// Non-activating, and key only when asked (a reply) or when a field in it is clicked.
+private final class CardPanel: NSPanel {
+    /// The menu bar icon's frame, in screen coordinates.
+    var anchor: NSRect = .zero
+
+    init() {
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        level = .statusBar
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        becomesKeyOnlyIfNeeded = true
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        animationBehavior = .none
+        let host = CardHostingView(rootView: AnyView(PopupStack().tint(.janus)))
+        host.sizingOptions = [.intrinsicContentSize]
+        host.onResize = { [weak self] in self?.fit() }
+        contentView = host
     }
 
-    /// Release the popover once closed: a hidden one keeps its views (and their timers) alive.
-    func popoverDidClose(_ notification: Notification) {
-        popover?.contentViewController = nil
-        popover = nil
-        anchorWindow?.orderOut(nil)
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    /// Sized to the cards and placed under the icon (top edge fixed). Called after the cards change, never from
+    /// inside a layout pass: resizing the window from layout (what NSHostingController's window sizing does, with
+    /// the panel then moving itself) fed back into layout until the stack ran out.
+    func fit() {
+        guard let host = contentView else { return }
+        let size = host.fittingSize
+        guard size.width > 0, size.height > 0 else { return }
+        let target = placed(size)
+        if target != frame { setFrame(target, display: isVisible) }
     }
 
-    /// Our menu bar button, or (when the menu bar hides it) an invisible 2×1 pt window where it would be.
-    private func anchor() -> NSView? {
-        if let b = StatusItemController.shared.button, b.window?.isVisible == true { return b }
-        guard let icon = ReceivePopup.statusItemFrame() else { return nil }
-        let w = anchorWindow ?? {
-            let w = NSWindow(contentRect: .zero, styleMask: [.borderless], backing: .buffered, defer: false)
-            w.isOpaque = false
-            w.backgroundColor = .clear
-            w.ignoresMouseEvents = true
-            w.level = .statusBar
-            w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-            w.isReleasedWhenClosed = false
-            return w
-        }()
-        anchorWindow = w
-        w.setFrame(NSRect(x: icon.midX - 1, y: icon.minY - 1, width: 2, height: 1), display: false)
-        w.orderFrontRegardless()
-        return w.contentView
+    private func placed(_ size: NSSize) -> NSRect {
+        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: anchor.midX, y: anchor.midY)) } ?? NSScreen.main
+        let bounds = screen?.visibleFrame ?? .zero
+        let x = min(max(anchor.midX - size.width / 2, bounds.minX + 8), bounds.maxX - 8 - size.width)
+        return NSRect(x: x.rounded(), y: (anchor.minY - 6 - size.height).rounded(), width: size.width, height: size.height)
+    }
+}
+
+/// The cards' SwiftUI view. When what they need changes, the panel refits on the next turn of the run loop.
+private final class CardHostingView: NSHostingView<AnyView> {
+    var onResize: (() -> Void)?
+
+    override func invalidateIntrinsicContentSize() {
+        super.invalidateIntrinsicContentSize()
+        DispatchQueue.main.async { [weak self] in self?.onResize?() }
     }
 }
 
@@ -129,6 +173,10 @@ struct PopupStack: View {
         // Like a notification banner, the popup never becomes the active window, yet its buttons should look live.
         .environment(\.controlActiveState, .key)
         .frame(width: stacked ? Self.width + 16 : nil)
+        // The panel itself is transparent: the cards sit on the popover material, its corners concentric with the
+        // platters'. Not glass: the cards' buttons are glass, and glass on glass made SwiftUI recurse until it crashed.
+        .background(PopoverMaterial())
+        .clipShape(RoundedRectangle(cornerRadius: stacked ? 26 : 18, style: .continuous))
         .animation(.snappy(duration: 0.25), value: shown)
         .animation(.snappy(duration: 0.25), value: folded.count)
     }
@@ -183,6 +231,19 @@ private struct FoldedNotifications: View {
         .buttonStyle(.plain)
         .help("Show all notifications")
     }
+}
+
+/// The material an NSPopover draws behind its content.
+private struct PopoverMaterial: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .popover
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 extension EnvironmentValues {

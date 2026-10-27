@@ -130,6 +130,7 @@ final class AppModel {
     /// Called when the panel or main window shows or hides. While hidden nothing here runs at all.
     func uiVisibilityChanged() {
         guard Self.uiVisible else { return }   // the loops end themselves once hidden
+        StatusItemController.shared.missedCalls = 0   // seen
         startLatencyLoop()
         for d in connectedDevices { d.watchLive() }
     }

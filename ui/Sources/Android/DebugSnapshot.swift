@@ -252,6 +252,15 @@ enum DebugSnapshot {
             debugLog("device \(d.name): reachable \(d.isReachable), battery \(d.batteryCharge.map(String.init) ?? "-") charging \(d.isCharging), ringer \(d.status?.ringer ?? "-"), cloud \(CloudService.shared.canReach(d))")
             return
         }
+        if name == "statusitem", let b = StatusItemController.shared.button,
+           let rep = b.bitmapImageRepForCachingDisplay(in: b.bounds) {
+            // The menu bar item as drawn, and what it says (title, tooltip, VoiceOver).
+            b.cacheDisplay(in: b.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("statusitem.png"))
+            try? "title=\(b.title)\ntooltip=\(b.toolTip ?? "")\nax=\(b.accessibilityLabel() ?? "")\nsize=\(b.bounds.size)"
+                .write(to: dir.appendingPathComponent("statusitem.txt"), atomically: true, encoding: .utf8)
+            return
+        }
         if name == "panelstate" {
             let sc = StatusItemController.shared
             debugLog("panel: shown \(sc.isPanelShown), button window \(sc.button?.window.map { "\($0.frame) visible \($0.isVisible)" } ?? "none"), popup shown \(PopupHost.shared.isShown) cards \(PopupHost.shared.hasCards), locked \(MacState.isLocked)")

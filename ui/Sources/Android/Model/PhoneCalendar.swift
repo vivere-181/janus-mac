@@ -427,7 +427,6 @@ struct CalendarSettingsSection: View {
 
     var body: some View {
         Section {
-            Toggle("Show the next event next to the menu bar icon", isOn: $store.showInMenuBar)
             Picker("Remind me (and show the countdown)", selection: $store.alertMinutes) {
                 Text("Never").tag(-1)
                 Text("When an event starts").tag(0)
