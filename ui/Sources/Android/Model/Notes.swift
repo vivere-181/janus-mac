@@ -78,6 +78,10 @@ final class NotesStore {
     private(set) var notes: [Note] = []
     /// Per phone: note id → the rev that phone is known to have.
     @ObservationIgnored private var acked: [String: [String: String]] = [:]
+    /// Recent versions' text per note (rev → text), so a conflict can be merged against the version both sides last
+    /// had. Kept: what any phone has, plus the last few.
+    @ObservationIgnored private var history: [String: [Version]] = [:]
+    private struct Version: Codable, Equatable { var rev: String; var text: String }
     /// Phones we're syncing with right now, and when we last heard from them.
     private(set) var lastSync: [String: Date] = [:]
     @ObservationIgnored private var pushTask: Task<Void, Never>?
@@ -86,7 +90,11 @@ final class NotesStore {
         didSet { if !paused, oldValue { for d in peers() { connected(d) } } }
     }
 
-    private struct Saved: Codable { var notes: [Note]; var acked: [String: [String: String]] }
+    private struct Saved: Codable {
+        var notes: [Note]
+        var acked: [String: [String: String]]
+        var history: [String: [Version]]?
+    }
     private static var file: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Android", isDirectory: true)
@@ -96,8 +104,9 @@ final class NotesStore {
 
     private init() {
         if let data = try? Data(contentsOf: Self.file), let saved = try? JSONDecoder().decode(Saved.self, from: data) {
-            notes = saved.notes; acked = saved.acked
+            notes = saved.notes; acked = saved.acked; history = saved.history ?? [:]
         }
+        for n in notes { remember(n) }
         purge()
     }
 
@@ -117,6 +126,7 @@ final class NotesStore {
     func create(text: String = "") -> Note {
         let n = Note(id: UUID().uuidString.lowercased(), text: text)
         notes.append(n)
+        remember(n)
         changed()
         return n
     }
@@ -140,6 +150,7 @@ final class NotesStore {
     func deleteNow(_ id: String) {
         notes.removeAll { $0.id == id }
         for k in acked.keys { acked[k]?[id] = nil }
+        history[id] = nil
         save()
     }
 
@@ -151,6 +162,7 @@ final class NotesStore {
         n.rev = UUID().uuidString.lowercased()
         n.modified = Note.now
         notes[i] = n
+        remember(n)
         changed()
     }
 
@@ -250,11 +262,18 @@ final class NotesStore {
             save()
         case "push":
             var acks: [[String: String]] = []
-            var changedHere = false
+            var changedHere = false, keptOurs = false
             for item in o["notes"] as? [[String: Any]] ?? [] {
                 guard let d = try? JSONSerialization.data(withJSONObject: item),
                       let incoming = try? JSONDecoder().decode(Note.self, from: d) else { continue }
-                if apply(incoming, base: item["base"] as? String, senderHad: acked[device.id]?[incoming.id]) { changedHere = true }
+                switch apply(incoming, base: item["base"] as? String, senderHad: acked[device.id]?[incoming.id], from: device) {
+                case .unchanged: break
+                case .changed: changedHere = true
+                case .keptOurs:
+                    // Ours won a conflict: not acked, so the sender (whose edit lost) sees the conflict too and merges.
+                    keptOurs = true
+                    continue
+                }
                 acked[device.id, default: [:]][incoming.id] = incoming.rev
                 acks.append(["id": incoming.id, "rev": incoming.rev])
             }
@@ -262,37 +281,82 @@ final class NotesStore {
             if !acks.isEmpty { send(["v": 1, "op": "ack", "acks": acks], to: device) }
             NoteAttachments.shared.requestMissing(from: device)
             // Conflicts and other phones: whatever anyone is missing now goes out.
-            if changedHere { for d in peers() { push(to: d) } }
+            if changedHere { for d in peers() { push(to: d) } } else if keptOurs { push(to: device) }
         default: break
         }
     }
 
-    /// Takes a note from a phone. Returns true when something here changed (other peers may need it).
+    private enum Outcome { case unchanged, changed, keptOurs }
+
+    /// Takes a note from a phone.
     /// `senderHad`: the version the sender already had from us (it sent it, or acked ours). Its `base` can lag
     /// behind while acks are in flight (edits pushed about a second apart), so that counts as agreeing too.
-    private func apply(_ incoming: Note, base: String?, senderHad: String?) -> Bool {
+    ///
+    /// Both changed since they last agreed (a conflict): the later edit wins (same time: the larger rev), and only the
+    /// side whose edit lost resolves it, so the two sides never resolve it differently (shared/CONTRACT.md →
+    /// ge.connect.notes, 2026-11-18):
+    /// - we won: keep ours and don't ack theirs; the sender then gets ours, sees the conflict and resolves it;
+    /// - we lost: merge both edits line by line against the version both last had; where they changed the same line
+    ///   differently, take theirs and keep ours as a copy named after this Mac.
+    private func apply(_ incoming: Note, base: String?, senderHad: String?, from device: Device) -> Outcome {
         guard let i = notes.firstIndex(where: { $0.id == incoming.id }) else {
             notes.append(incoming)
-            return true
+            remember(incoming)
+            return .changed
         }
         let local = notes[i]
-        if local.rev == incoming.rev { return false }
-        if base == local.rev || senderHad == local.rev {
+        if local.rev == incoming.rev { return .unchanged }
+        if base == local.rev || senderHad == local.rev || (local.text == incoming.text && (local.deleted == nil) == (incoming.deleted == nil)) {
             notes[i] = incoming
-            return true
+            remember(incoming)
+            return .changed
         }
-        // Both changed since they last agreed: the later edit keeps the id (same time: the larger rev), the other
-        // becomes a copy. Both sides make the identical copy (id from the losing rev), so it isn't duplicated.
+        remember(incoming)   // the other side's version, as a starting point for later merges
         let incomingWins = (Note.ms(incoming.modified), incoming.rev) > (Note.ms(local.modified), local.rev)
-        let (winner, loser) = incomingWins ? (incoming, local) : (local, incoming)
-        notes[i] = winner
-        if loser.deleted == nil, loser.text != winner.text {
-            let copy = Note(id: Note.uuid3("conflict:\(loser.id):\(loser.rev)"), rev: loser.rev, text: loser.text,
-                            pinned: loser.pinned, created: loser.created, modified: loser.modified)
-            if !notes.contains(where: { $0.id == copy.id }) { notes.append(copy) }
+        guard incomingWins else {
+            AppModel.shared.log(.info, "Notes: \"\(local.title)\" was changed on both sides; \(device.name) will merge")
+            return .keptOurs
         }
-        AppModel.shared.log(.info, "Notes: \"\(winner.title)\" was changed on both sides; kept both versions")
-        return true
+        notes[i] = incoming
+        // Our edit lost. Nothing to keep if ours was a deletion.
+        guard local.deleted == nil else { return .changed }
+        if incoming.deleted == nil,
+           let start = [base, senderHad].lazy.compactMap({ $0 }).compactMap({ rev in self.history[incoming.id]?.last { $0.rev == rev }?.text }).first,
+           let merged = NoteMerge.merge(base: start, winner: incoming.text, loser: local.text) {
+            if merged != incoming.text {
+                var n = incoming
+                n.text = merged
+                n.rev = UUID().uuidString.lowercased()
+                n.modified = Note.now
+                notes[i] = n
+                remember(n)
+            }
+            AppModel.shared.log(.info, "Notes: \"\(incoming.title)\" was changed here and on \(device.name); merged")
+            return .changed
+        }
+        // The same lines changed both ways (or they deleted it): ours stays as a copy, named for this Mac.
+        let copy = Note(id: Note.uuid3("copy:\(local.id):\(local.rev)"), text: NoteMerge.labelled(local.text, from: Self.thisMac),
+                        pinned: local.pinned, created: local.created, modified: local.modified)
+        if !notes.contains(where: { $0.id == copy.id }) { notes.append(copy); remember(copy) }
+        AppModel.shared.log(.info, "Notes: \"\(incoming.title)\" was changed here and on \(device.name); kept this Mac's version as a copy")
+        return .changed
+    }
+
+    private static var thisMac: String { Host.current().localizedName ?? "Mac" }
+
+    /// Keeps a version's text: what any phone has, plus the last few.
+    private func remember(_ n: Note) {
+        var list = history[n.id] ?? []
+        if list.last?.rev != n.rev {
+            list.removeAll { $0.rev == n.rev }
+            list.append(Version(rev: n.rev, text: n.text))
+        }
+        if list.count > 8 {
+            let held = Set(acked.values.compactMap { $0[n.id] })
+            let recent = Set(list.suffix(6).map(\.rev))
+            list.removeAll { !held.contains($0.rev) && !recent.contains($0.rev) }
+        }
+        history[n.id] = list
     }
 
     // MARK: Storage
@@ -303,6 +367,7 @@ final class NotesStore {
         guard !gone.isEmpty else { return }
         notes.removeAll { gone.contains($0.id) }
         for k in acked.keys { gone.forEach { acked[k]?[$0] = nil } }
+        gone.forEach { history[$0] = nil }
         save()
     }
 
@@ -327,7 +392,7 @@ final class NotesStore {
     func writeNow(sync: Bool = false) {
         saveTask?.cancel(); saveTask = nil
         NotesWidgets.publish(live)
-        let saved = Saved(notes: notes, acked: acked)
+        let saved = Saved(notes: notes, acked: acked, history: history)
         let url = Self.file
         let write = { if let data = try? JSONEncoder().encode(saved) { try? data.write(to: url, options: .atomic) } }
         if sync { write() } else { Task.detached(priority: .utility) { write() } }

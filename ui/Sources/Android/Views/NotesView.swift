@@ -97,6 +97,11 @@ struct NotesPane: View {
         .contextMenu {
             if n.deleted == nil {
                 Button(n.pinned ? "Unpin" : "Pin") { store.togglePin(n.id) }
+                if NotchController.hasNotch {
+                    Button(NotchController.shared.noteIDs.contains(n.id) ? "Remove from Notch" : "Show in Notch") {
+                        NotchController.shared.toggleNote(n.id)
+                    }
+                }
                 Button("Delete", role: .destructive) { delete(n.id) }
             } else {
                 Button("Restore") { restore(n.id) }

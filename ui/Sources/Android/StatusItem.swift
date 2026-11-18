@@ -215,7 +215,8 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
 
     // MARK: Drop on the icon
 
-    private var dropTarget: Device? {
+    /// Where something dropped on the icon (or the notch) goes.
+    var dropTarget: Device? {
         let model = AppModel.shared
         if let d = model.selectedDevice, d.isReachable { return d }
         return model.connectedDevices.first(where: DeviceTrust.isMine) ?? model.connectedDevices.first
@@ -238,18 +239,25 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
         guard let device = dropTarget else { return false }
         let pb = sender.draggingPasteboard
         let files = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        let link = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?.first { $0.scheme?.hasPrefix("http") == true }
+        return Self.send(files: files, link: link, text: pb.string(forType: .string), to: device)
+    }
+
+    /// Sends what was dropped: files, else a web link, else text, and says so in a card.
+    @discardableResult
+    static func send(files: [URL], link: URL?, text: String?, to device: Device) -> Bool {
         if !files.isEmpty {
             device.share(files)
             let what = files.count == 1 ? files[0].lastPathComponent : "\(files.count) files"
             MacPopup.shared.show(.init(symbol: "paperplane.fill", tint: .blue, title: "Sending \(what)", subtitle: "To \(device.name)"))
             return true
         }
-        if let url = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?.first, url.scheme?.hasPrefix("http") == true {
+        if let url = link, url.scheme?.hasPrefix("http") == true {
             device.shareText(url.absoluteString)
             MacPopup.shared.show(.init(symbol: "safari.fill", tint: .blue, title: "Link sent", subtitle: "Opening on \(device.name)"))
             return true
         }
-        if let text = pb.string(forType: .string), !text.isEmpty {
+        if let text, !text.isEmpty {
             device.shareText(text)
             MacPopup.shared.show(.init(symbol: "text.quote", tint: .blue, title: "Text sent", subtitle: "To \(device.name)"))
             return true
@@ -299,32 +307,35 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
     func updateLiveLabel() {
         guard let item, let button = item.button else { return }
         let model = AppModel.shared
-        let phone = model.connectedDevices.first(where: DeviceTrust.isMine) ?? model.connectedDevices.first
+        let phone = model.phone
         let activity = Self.showsLiveLabel ? model.connectedDevices.lazy.compactMap(\.headlineActivity).first : nil
         let call = Self.showsLiveLabel ? model.connectedDevices.lazy.compactMap(\.activeCall).first : nil
         let calendar = CalendarStore.shared
         let now = Date()
+        // The notch shows what's running (a call, live activities, transfers) beside the camera; the menu bar then
+        // leaves those to it.
+        let inNotch = NotchController.shared.isActive
         // An event starting right now briefly beats a live activity; otherwise the calendar comes after it.
-        let imminent = call == nil ? calendar.imminent(at: now) : nil
+        let imminent = call == nil || inNotch ? calendar.imminent(at: now) : nil
         let liveText = activity?.label(at: now)
         let transfer = MenuBarPrefs.transfers ? Self.transferLabel() : nil
         // The tooltip names whatever the text had to leave out.
-        let alsoMeeting = liveText != nil && imminent == nil ? calendar.headline(at: now)?.text : nil
+        let alsoMeeting = liveText != nil && imminent == nil && !inNotch ? calendar.headline(at: now)?.text : nil
         let alsoLive = imminent != nil ? liveText.map { t in [activity?.title, t].compactMap { $0 }.joined(separator: " ") } : nil
         var label: Label?
-        if let call {
+        if let call, !inNotch {
             label = Label(text: CallTimer.format(Date().timeIntervalSince(call.start)),
-                          tooltip: "On call with \(call.name.isEmpty ? call.number : call.name)", green: true)
+                          tooltip: "On call with \(call.name.isEmpty ? call.number : call.name)", green: true, icon: "phone.fill")
         } else if let imminent {
             label = Label(text: imminent.text, tooltip: (["\(imminent.event.title) · \(imminent.event.timeRange)"] + [alsoLive].compactMap { $0 })
-                .joined(separator: "\n"))
-        } else if let text = liveText {
+                .joined(separator: "\n"), icon: "calendar")
+        } else if let text = liveText, !inNotch {
             label = Label(text: text, tooltip: ([[activity?.app, activity?.title].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")]
-                                                + [alsoMeeting].compactMap { $0 }).joined(separator: "\n"))
-        } else if let transfer {
+                                                + [alsoMeeting].compactMap { $0 }).joined(separator: "\n"), icon: activity?.symbol)
+        } else if let transfer, !inNotch {
             label = transfer
         } else if let meeting = calendar.headline(at: now) {
-            label = Label(text: meeting.text, tooltip: "\(meeting.event.title) · \(meeting.event.timeRange)")
+            label = Label(text: meeting.text, tooltip: "\(meeting.event.title) · \(meeting.event.timeRange)", icon: "calendar")
         } else {
             label = Self.batteryLabel(phone)
         }
@@ -336,6 +347,18 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
                      missed > 0 ? (missed == 1 ? "1 missed call" : "\(missed) missed calls") : nil].compactMap { $0 }
         let tooltip = ([label?.tooltip].compactMap { $0 } + notes + signs.map(\.tip)).joined(separator: "\n")
         let dot = unread + missed > 0
+        // Beside the notch's camera: only what's running (a call, a live activity, a transfer). No calendar, no
+        // battery: the menu bar keeps those.
+        let running: Label? = if let call {
+            Label(text: CallTimer.format(Date().timeIntervalSince(call.start)), tooltip: "", green: true, icon: "phone.fill")
+        } else if let liveText {
+            Label(text: liveText, tooltip: "", icon: activity?.symbol)
+        } else {
+            transfer
+        }
+        let notchLabel = running.map { NotchLabel(text: $0.text, icon: $0.icon ?? $0.symbol, green: $0.green,
+                                                  urgent: call != nil, live: call == nil) }
+        if NotchController.shared.label != notchLabel, !NotchController.shared.debugHold { NotchController.shared.label = notchLabel }
 
         // The menu bar is only touched when something changed (a tick usually changes nothing).
         let key = [label.map { "\($0.green)|\($0.symbol ?? "")|\($0.text)" } ?? "", "\(dot)",
@@ -377,7 +400,10 @@ final class StatusItemController: NSObject, NSPopoverDelegate, NSWindowDelegate 
         var text: String
         var tooltip: String?
         var green = false
+        /// Drawn before the text in the menu bar (battery, transfer direction).
         var symbol: String? = nil
+        /// What it is, for the notch's left side (the menu bar has the logo there instead).
+        var icon: String? = nil
     }
 
     /// A small sign by the logo; `level` fills a variable symbol (signal bars).

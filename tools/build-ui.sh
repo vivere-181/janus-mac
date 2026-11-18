@@ -69,6 +69,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSBonjourServices</key>
   <array><string>_adb-tls-pairing._tcp</string><string>_adb-tls-connect._tcp</string><string>_kdeconnect._udp</string><string>_androidtvremote2._tcp</string></array>
   <key>NSMicrophoneUsageDescription</key><string>Janus listens while you hold the TV remote's microphone button.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Janus shows what Spotify is playing in the notch, with its cover, and plays, pauses and skips it from there.</string>
   <key>NSSpeechRecognitionUsageDescription</key><string>Janus turns what you say into a request for your TV's assistant.</string>
   <key>CFBundleURLTypes</key>
   <array>

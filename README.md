@@ -18,8 +18,11 @@ named after the Roman god of doorways, who looks both ways: one app, two sides.
   and paste on the other. Janus is in the Mac's Share menu, too.
 - **Calendar**: your phone's calendars, a week view, reminders, and a countdown to the next meeting in the menu bar.
 - **Notes**: notes with formatting, checklists, tables and attachments, synced with the phone, with a Quick Note
-  shortcut and desktop widgets where you can tick off checklist items.
+  shortcut and desktop widgets where you can tick off checklist items. Edits made on both at once are merged.
 - **Live activities**: deliveries, rides, timers and navigation from the phone, in the menu bar.
+- **The notch** (MacBooks with one): rest the pointer on it for Spotify (cover, progress, controls), sending files to
+  your phone (or drop them on the notch) and the notes you pick. Calls, timers and other live activities appear beside
+  the camera, growing out of it like the iPhone's Dynamic Island.
 - **Mirroring**: see and control your phone's screen, with sound, even while the phone's screen stays off.
 - **Your Mac from your phone**: lock, mute, find your Mac, take screenshots, or use the phone as a touchpad and
   keyboard.
@@ -63,7 +66,10 @@ brew install --cask android-platform-tools
 - Janus has no account and no Janus server, and it collects no analytics. Your phone and your Mac talk to each other
   directly on your network.
 - Everything between them is encrypted (TLS), and only devices you've paired can connect.
-- Janus goes online only to check GitHub for updates, and to reach your own relay if you set up Janus Cloud.
+- Janus goes online only to check GitHub for updates, to load the cover of what Spotify is playing from Spotify's
+  image server (for the notch), and to reach your own relay if you set up Janus Cloud.
+- **Spotify**: for the notch, Janus listens to Spotify's own announcements of what it plays. macOS asks once whether
+  Janus may control Spotify; that's for the cover and the play, pause and skip buttons, and nothing else.
 - **Janus Cloud** (optional) keeps your devices connected when they aren't on the same network, through a relay you
   run yourself. Everything is encrypted on your devices, so the relay can't read your files or their names.
 

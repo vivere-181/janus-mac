@@ -183,6 +183,18 @@ enum DebugSnapshot {
             cc.quiet = false
             return
         }
+        // livetimer / liveclear: a running timer on the phone (for the menu bar and the notch), and its removal.
+        if name == "livetimer", let d = model.phone {
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            d.upsertLive(id: "sim.timer", json: #"{"v":1,"app":"Clock","title":"Tea","text":"Timer","when":\#(now + 180_000),"chrono":"down","cat":"stopwatch","now":\#(now)}"#, iconPath: nil, via: "test")
+            StatusItemController.shared.updateLiveLabel()
+            return
+        }
+        if name == "liveclear", let d = model.phone {
+            d.live.removeAll { $0.id == "sim.timer" }
+            StatusItemController.shared.updateLiveLabel()
+            return
+        }
         // appcall: an app's ongoing-call live activity (as the phone sends WhatsApp's) and a timer: which are kept.
         if name == "appcall", let d = model.selectedDevice {
             let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -259,6 +271,68 @@ enum DebugSnapshot {
             try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent("statusitem.png"))
             try? "title=\(b.title)\ntooltip=\(b.toolTip ?? "")\nax=\(b.accessibilityLabel() ?? "")\nsize=\(b.bounds.size)"
                 .write(to: dir.appendingPathComponent("statusitem.txt"), atomically: true, encoding: .utf8)
+            return
+        }
+        if name.hasPrefix("notestext:") {
+            // notestext:<id>|<file>: the note's text becomes the file's (synced like an edit).
+            let p = name.dropFirst(10).split(separator: "|", maxSplits: 1).map(String.init)
+            if p.count == 2, let text = try? String(contentsOf: URL(fileURLWithPath: p[1]), encoding: .utf8) { NotesStore.shared.setText(p[0], text) }
+            return
+        }
+        if name.hasPrefix("notesdelete:") { NotesStore.shared.delete(String(name.dropFirst(12))); return }
+        if name.hasPrefix("notch:") {
+            // Notch testing: notch:open | notch:close | notch:label | notch:shot | notch:hit
+            let c = NotchController.shared
+            switch name.dropFirst(6) {
+            case "open": c.debugOpen()
+            case "close": c.debugHold = false; c.close()
+            case "label": c.debugHold = true; c.label = NotchLabel(text: "8 min", icon: "car.fill", live: true)
+            case "calllabel": c.debugHold = true; c.label = NotchLabel(text: "12:04", icon: "phone.fill", green: true, urgent: true)
+            case "release": c.debugHold = false; c.label = nil; c.debugTrack = nil
+            case "mac":
+                let m = MacNowPlaying.shared
+                try? "track \(m.track.map { "\($0.title) — \($0.artist) [\($0.bundleID)] playing \($0.isPlaying)" } ?? "none") artwork \(m.artwork.map { "\($0.size)" } ?? "none")"
+                    .write(to: dir.appendingPathComponent("notch-mac.txt"), atomically: true, encoding: .utf8)
+            case "drop": c.debugHold = true; c.setDropTargeted(true)
+            case "undrop": c.setDropTargeted(false)
+            case "picknote": if let n = NotesStore.shared.live.first(where: { !$0.preview.isEmpty }) { c.toggleNote(n.id) }
+            case "unpicknotes": c.noteIDs = []
+            case "silent": c.debugSilent = true; c.debugTrack = nil
+            case "unsilent": c.debugSilent = false
+            case "nolabel": c.debugHold = true; c.label = nil
+            case "fakesong":
+                // A track with a length (for the scrubber), artwork drawn here.
+                let art = NSImage(size: NSSize(width: 120, height: 120), flipped: false) { r in
+                    NSGradient(colors: [.systemIndigo, .systemPink, .systemOrange])?.draw(in: r, angle: 45); return true
+                }
+                c.debugHold = true
+                c.debugTrack = NotchTrack(source: .mac(bundleID: "com.spotify.client"), title: "Moonshine", artist: "Caravan Palace",
+                                          isPlaying: true, artwork: art, duration: 214, elapsed: 72, elapsedAt: .now, canSeek: true)
+            case "music":
+                // The current track, shown as playing.
+                guard var t = NotchTrack.current(includingPaused: true) else { return }
+                t.isPlaying = true
+                c.debugHold = true
+                c.debugTrack = t
+            case let shot where shot.hasPrefix("shot"):
+                // notch:shot → notch.png; notch:shot-<name> → notch-<name>.png (frames of an animation)
+                let file = shot == "shot" ? "notch.png" : "notch\(shot.dropFirst(4)).png"
+                typealias Capture = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+                if let w = c.window, let sym = dlsym(dlopen(nil, RTLD_NOW), "CGWindowListCreateImage"),
+                   let image = unsafeBitCast(sym, to: Capture.self)(.null, 8, UInt32(w.windowNumber), 8)?.takeRetainedValue() {
+                    try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(file))
+                }
+            case "hit":
+                // Which window a click would reach: on the island it's ours; on the transparent rest, what's below.
+                guard let w = c.window else { return }
+                let f = w.frame
+                let points = [("island", NSPoint(x: f.midX, y: f.maxY - 10)), ("left of island", NSPoint(x: f.minX + 40, y: f.maxY - 10)),
+                              ("below island", NSPoint(x: f.midX, y: f.maxY - 300)), ("corner", NSPoint(x: f.minX + 20, y: f.minY + 20))]
+                let lines = points.map { "\($0.0): \(NSWindow.windowNumber(at: $0.1, belowWindowWithWindowNumber: 0) == w.windowNumber ? "notch" : "below")" }
+                try? (["frame \(f) mode \(c.mode) active \(c.isActive)"] + lines).joined(separator: "\n")
+                    .write(to: dir.appendingPathComponent("notch.txt"), atomically: true, encoding: .utf8)
+            default: break
+            }
             return
         }
         if name == "panelstate" {

@@ -57,6 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         model = AppModel.shared
         StatusItemController.shared.install()
+        NotchController.shared.start()
         MacState.install()
         QuickNoteHotKey.shared.register()
         AppIcon.install()

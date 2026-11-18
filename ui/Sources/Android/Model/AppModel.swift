@@ -153,6 +153,11 @@ final class AppModel {
         }
     }
 
+    /// The connected phone (yours first; never the TV), for the menu bar, the notch and its drop strip.
+    var phone: Device? {
+        connectedDevices.first { DeviceTrust.isMine($0) && !$0.isTV } ?? connectedDevices.first { !$0.isTV }
+    }
+
     var selectedDevice: Device? {
         // Phones first: a TV is only shown when picked (or when it's the only device).
         devices.first { $0.id == selectedDeviceID } ?? pairedDevices.first { !$0.isTV } ?? pairedDevices.first

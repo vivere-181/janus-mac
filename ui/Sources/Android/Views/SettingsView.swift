@@ -73,6 +73,7 @@ private struct GeneralSettings: View {
             NotesSettingsSection()
             CloudSettingsSection()
             MenuBarSettingsSection()
+            if NotchController.hasNotch { NotchSettingsSection() }
             Section("Notifications on This Mac") {
                 if notificationsDenied {
                     Label("Notifications are turned off for Janus in System Settings, so none of these will appear.",
@@ -528,5 +529,25 @@ private struct MenuBarSettingsSection: View {
         }
         .onChange(of: [live, transfers, unread, mirroring, dnd, cloud, signal]) { StatusItemController.shared.updateLiveLabel() }
         .onChange(of: battery) { StatusItemController.shared.updateLiveLabel() }
+    }
+}
+
+/// Settings → General → Notch (Macs with a notch): Janus in the camera housing of the built-in display.
+private struct NotchSettingsSection: View {
+    @AppStorage("notch.enabled") private var enabled = true
+    @AppStorage("notch.music") private var music = true
+
+    var body: some View {
+        Section {
+            Toggle("Show Janus in the notch", isOn: $enabled)
+            Toggle("Show Spotify while it plays", isOn: $music)
+                .disabled(!enabled)
+        } header: {
+            Text("Notch")
+        } footer: {
+            Text("Rest the pointer on the notch to see Spotify, send files to your phone (or drop them on the notch) and read the notes you chose (Notes → right-click → Show in Notch). Calls, timers and other live activities show beside the camera while they last; notifications stay in the menu bar. Spotify is this Mac's or, when it isn't playing here, your phone's.")
+        }
+        .onChange(of: enabled) { NotchController.shared.update() }
+        .onChange(of: music) { NotchController.shared.update() }
     }
 }

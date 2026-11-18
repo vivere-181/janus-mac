@@ -23,6 +23,9 @@ for ext in "$APP"/Contents/PlugIns/*.appex(N); do
   [[ ${ext:t} == JanusWidgets.appex ]] && ent="$M/ui/WidgetExtension/JanusWidgets.entitlements"
   codesign --force --sign "$SIGN" --entitlements "$ent" "$ext" 2>&1 | grep -v 'replacing existing signature' || true
 done
+for fw in "$APP"/Contents/Frameworks/*.framework(N); do
+  codesign --force --sign "$SIGN" "$fw" 2>&1 | grep -v 'replacing existing signature' || true
+done
 codesign --force --sign "$SIGN" --identifier "$ID" "$APP" 2>&1 | grep -v 'replacing existing signature' || true
 codesign --verify --deep --strict "$APP"
 if [ "$SIGN" = "-" ]; then

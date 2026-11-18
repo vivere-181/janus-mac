@@ -39,20 +39,33 @@ final class PopupHost {
         guard let icon = ReceivePopup.statusItemFrame() else { return }
         let p = panel ?? CardPanel()
         panel = p
-        p.anchor = icon
+        // The icon's middle, and the menu bar's bottom edge (the icon's slot is taller than the icon).
+        let barBottom = StatusItemController.shared.button?.window?.frame.minY ?? icon.minY
+        p.anchor = NSRect(x: icon.minX, y: barBottom, width: icon.width, height: max(icon.maxY - barBottom, 1))
         if !p.isVisible {
             p.fit()
             p.alphaValue = 0
             p.orderFrontRegardless()
             NSAnimationContext.runAnimationGroup { $0.duration = 0.2; p.animator().alphaValue = 1 }
         }
-        if typing, !p.isKeyWindow {
-            p.makeKey()
-        } else if !typing, p.isKeyWindow {
+        keyboard(p)
+    }
+
+    /// The cards' window has the keyboard only while a reply is typed.
+    private func keyboard(_ w: NSWindow) {
+        if typing, !w.isKeyWindow {
+            w.makeKey()
+        } else if !typing, w.isKeyWindow {
             // Ordering out hands the keyboard back to the window you were in; back in front at once, unchanged.
-            p.orderOut(nil)
-            p.orderFrontRegardless()
+            w.orderOut(nil)
+            w.orderFrontRegardless()
         }
+    }
+
+    /// The cards' size changed (one came or went, a stack expanded, a reply field opened): refit the panel on the
+    /// next turn of the run loop, outside the layout pass that noticed.
+    func cardsResized() {
+        DispatchQueue.main.async { [weak self] in self?.panel?.fit() }
     }
 
     /// The menu bar panel is opening: out of its way at once, without animation (the cards are kept).
@@ -75,7 +88,7 @@ final class PopupHost {
 /// The cards' window: under the menu bar icon (centred on it, kept on screen), above other windows on every Space.
 /// Non-activating, and key only when asked (a reply) or when a field in it is clicked.
 private final class CardPanel: NSPanel {
-    /// The menu bar icon's frame, in screen coordinates.
+    /// The menu bar icon's horizontal extent, from the menu bar's bottom edge up (screen coordinates).
     var anchor: NSRect = .zero
 
     init() {
@@ -89,11 +102,21 @@ private final class CardPanel: NSPanel {
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         animationBehavior = .none
-        let host = CardHostingView(rootView: AnyView(PopupStack().tint(.janus)))
         host.sizingOptions = [.intrinsicContentSize]
         host.onResize = { [weak self] in self?.fit() }
-        contentView = host
+        effect.material = .popover
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        let container = NSView()
+        container.addSubview(effect)
+        container.addSubview(host)
+        contentView = container
     }
+
+    private let host = CardHostingView(rootView: AnyView(PopupStack().tint(.janus)))
+    /// The popover material, shaped like a popover: the body with an arrow pointing at the icon.
+    private let effect = NSVisualEffectView()
+    private var shape: (size: NSSize, arrowX: CGFloat, radius: CGFloat)?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -102,18 +125,53 @@ private final class CardPanel: NSPanel {
     /// inside a layout pass: resizing the window from layout (what NSHostingController's window sizing does, with
     /// the panel then moving itself) fed back into layout until the stack ran out.
     func fit() {
-        guard let host = contentView else { return }
-        let size = host.fittingSize
-        guard size.width > 0, size.height > 0 else { return }
+        let content = host.fittingSize
+        guard content.width > 0, content.height > 0 else { return }
+        let size = NSSize(width: content.width, height: content.height + CardShape.arrowHeight)
         let target = placed(size)
         if target != frame { setFrame(target, display: isVisible) }
+        if host.frame.size != content { host.frame = NSRect(origin: .zero, size: content) }
+        effect.frame = NSRect(origin: .zero, size: size)
+        let next = (size: size, arrowX: anchor.midX - target.minX, radius: CGFloat(PopupStack.isStacked ? 26 : 18))
+        if shape.map({ $0.size != next.size || $0.arrowX != next.arrowX || $0.radius != next.radius }) ?? true {
+            shape = next
+            effect.maskImage = CardShape.mask(size: next.size, arrowX: next.arrowX, radius: next.radius)
+            invalidateShadow()
+        }
     }
 
     private func placed(_ size: NSSize) -> NSRect {
         let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: anchor.midX, y: anchor.midY)) } ?? NSScreen.main
         let bounds = screen?.visibleFrame ?? .zero
         let x = min(max(anchor.midX - size.width / 2, bounds.minX + 8), bounds.maxX - 8 - size.width)
-        return NSRect(x: x.rounded(), y: (anchor.minY - 6 - size.height).rounded(), width: size.width, height: size.height)
+        // The arrow's tip just under the menu bar, like a popover's.
+        return NSRect(x: x.rounded(), y: (anchor.minY - 2 - size.height).rounded(), width: size.width, height: size.height)
+    }
+}
+
+/// The card panel's outline: a rounded body with a popover arrow on top, its tip at `arrowX` (kept clear of the
+/// corners when the panel has to shift to stay on screen).
+private enum CardShape {
+    static let arrowWidth: CGFloat = 22
+    static let arrowHeight: CGFloat = 9
+
+    static func mask(size: NSSize, arrowX: CGFloat, radius: CGFloat) -> NSImage {
+        NSImage(size: size, flipped: false) { _ in
+            let top = size.height - arrowHeight
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: size.width, height: top), xRadius: radius, yRadius: radius).fill()
+            let half = arrowWidth / 2
+            let x = min(max(arrowX, radius + half), size.width - radius - half)
+            let arrow = NSBezierPath()
+            arrow.move(to: NSPoint(x: x - half, y: top - 1))
+            arrow.curve(to: NSPoint(x: x, y: size.height),
+                        controlPoint1: NSPoint(x: x - half * 0.45, y: top), controlPoint2: NSPoint(x: x - 2.2, y: size.height))
+            arrow.curve(to: NSPoint(x: x + half, y: top - 1),
+                        controlPoint1: NSPoint(x: x + 2.2, y: size.height), controlPoint2: NSPoint(x: x + half * 0.45, y: top))
+            arrow.close()
+            arrow.fill()
+            return true
+        }
     }
 }
 
@@ -134,11 +192,12 @@ struct PopupStack: View {
     static let width: CGFloat = 300
     static let platter = RoundedRectangle(cornerRadius: 18, style: .continuous)
 
-    private enum Card: Hashable {
+    fileprivate enum Card: Hashable {
         case call, mac, calendar(String), receive, banner(String)
     }
 
-    var body: some View {
+    /// What's active, in order.
+    fileprivate static var cards: [Card] {
         let mac = MacPopup.shared.content
         let banners = BannerCenter.shared.banners
         var cards: [Card] = []
@@ -146,10 +205,19 @@ struct PopupStack: View {
         if mac?.stays == true { cards.append(.mac) }
         cards += banners.filter(\.important).map { .banner($0.id) }
         cards += CalendarPopup.shared.cards.map { .calendar($0.alertKey) }
-        let notifications = banners.filter { !$0.important }
-        cards += notifications.map { .banner($0.id) }
+        cards += banners.filter { !$0.important }.map { .banner($0.id) }
         if ReceivePopup.shared.isActive { cards.append(.receive) }
         if let mac, !mac.stays { cards.append(.mac) }
+        return cards
+    }
+
+    /// Several cards: separate platters on a larger panel.
+    static var isStacked: Bool { cards.count > 1 }
+
+    var body: some View {
+        let banners = BannerCenter.shared.banners
+        let cards = Self.cards
+        let notifications = banners.filter { !$0.important }
 
         let folded = !BannerCenter.shared.expanded && notifications.count > 2 ? Array(notifications.dropFirst(2)) : []
         let foldedIDs = Set(folded.map { Card.banner($0.id) })
@@ -173,10 +241,11 @@ struct PopupStack: View {
         // Like a notification banner, the popup never becomes the active window, yet its buttons should look live.
         .environment(\.controlActiveState, .key)
         .frame(width: stacked ? Self.width + 16 : nil)
-        // The panel itself is transparent: the cards sit on the popover material, its corners concentric with the
-        // platters'. Not glass: the cards' buttons are glass, and glass on glass made SwiftUI recurse until it crashed.
-        .background(PopoverMaterial())
+        // The panel draws the popover material and arrow behind this; corners concentric with the platters'.
         .clipShape(RoundedRectangle(cornerRadius: stacked ? 26 : 18, style: .continuous))
+        // The panel follows the cards' natural size (the hosting view doesn't report it as a subview).
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGSize.self, of: { $0.size }) { _ in PopupHost.shared.cardsResized() }
         .animation(.snappy(duration: 0.25), value: shown)
         .animation(.snappy(duration: 0.25), value: folded.count)
     }
@@ -231,19 +300,6 @@ private struct FoldedNotifications: View {
         .buttonStyle(.plain)
         .help("Show all notifications")
     }
-}
-
-/// The material an NSPopover draws behind its content.
-private struct PopoverMaterial: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
-        v.material = .popover
-        v.blendingMode = .behindWindow
-        v.state = .active
-        return v
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 extension EnvironmentValues {
